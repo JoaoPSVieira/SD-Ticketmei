@@ -150,9 +150,9 @@ class MetricsMiddleware:
             REQUEST_DURATION.observe(duration)
 
 
-# ---------------------------------------------------------------------------
-# Aplicação
-# ---------------------------------------------------------------------------
+# -------------
+# - Aplicação -
+# -------------
 
 app = FastAPI(
     title="TicketMEI - Catalog",

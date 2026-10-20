@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # Tem de ser igual ao uid usado em grafana/dashboards/dashboard1.json
+    uid: a72340b1-d871-4028-bbf1-1795e3553e62
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

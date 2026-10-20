@@ -1,0 +1,15 @@
+# Normaliza finais de linha no repositório (evita problemas Windows CRLF vs Linux LF)
+* text=auto
+
+# Ficheiros que correm dentro de contentores Linux têm de ter LF
+*.sh       text eol=lf
+*.py       text eol=lf
+Dockerfile text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.js       text eol=lf
+*.json     text eol=lf
+
+# Imagens (screenshots do README)
+*.png binary
+*.jpg binary

@@ -7,68 +7,34 @@ Projeto da unidade curricular de **Sistemas Distribuídos** — Mestrado em Enge
 
 | Nome | Número | GitHub |
 |------|--------|--------|
-| _Nome 1_ | _00000_ | [@utilizador1](https://github.com/utilizador1) |
-| _Nome 2_ | _00000_ | [@utilizador2](https://github.com/utilizador2) |
-| _Nome 3_ | _00000_ | [@utilizador3](https://github.com/utilizador3) |
-
-## Estado das fases
-
-| Fase | Prazo | Conteúdo | Estado |
-|------|-------|----------|--------|
-| 1 | 21/10/2026 | API Gateway + Catalog, Docker Compose, Prometheus, Grafana | Em curso |
-| 2 | 28/10/2026 | Order + Notification, RabbitMQ | Por iniciar |
-| 3 | 04/11/2026 | Kubernetes, GitHub Actions + GHCR, ArgoCD, rate limiter com Redis | Por iniciar |
-
-## Arquitetura (Fase 1)
-
-```
-Cliente / k6 ──HTTP──▶ API Gateway (:8000) ──HTTP síncrono──▶ Catalog (:8001)
-                              │                                    │
-                              └──────── /metrics ◀── Prometheus ──▶┘
-                                                       ▲    │
-                                       cAdvisor (:8080)┘    ▼
-                                                         Grafana (:3000)
-```
-
-- Todo o tráfego dos clientes entra pelo **API Gateway**.
-- O **Catalog** é o único serviço com acesso aos dados dos eventos (`catalog/data/events.json`).
-- O **Prometheus** recolhe métricas de 5 em 5 segundos do endpoint `/metrics` de cada serviço e do cAdvisor.
-- O **Grafana** arranca já com o datasource e o dashboard "TicketMei - P1" configurados (provisioning).
+| João Pedro Sá Vieira | 2103823 | [JoaoPSVieira](https://github.com/JoaoPSVieira) |
+| Francisco Guilherme Fernandes Silva | 2114821 | [SkyJust4Fun](https://github.com/SkyJust4Fun) |
+| Rodrigo Sousa Soares | 2075526 | [SoaresRodrigo8](https://github.com/SoaresRodrigo8) |
 
 ## Estrutura do repositório
 
 ```
 .
-├── api-gateway/               # Serviço API Gateway (Python)
-├── catalog/                   # Serviço Catalog (Python)
-│   └── data/events.json       # Dados dos eventos (exclusivos do Catalog)
+├── api-gateway/               
+├── catalog/                   
+│   └── data/events.json       
 ├── prometheus/
-│   └── prometheus.yml         # Configuração de scraping
+│   └── prometheus.yml         
 ├── grafana/
-│   ├── provisioning/          # Datasource e provider de dashboards
-│   └── dashboards/            # dashboard1.json
+│   ├── provisioning/          
+│   └── dashboards/
 ├── k6/
-│   └── load-test.js           # Teste de carga
+│   └── load-test.js
 ├── docker-compose.yml
 └── README.md
 ```
 
 ## Como correr
-
-Requisitos: [Docker Desktop](https://www.docker.com/products/docker-desktop/) com Docker Compose v2.
-
 ```bash
-# Construir e arrancar todos os serviços
-docker compose up --build -d
-
-# Ver o estado dos contentores
-docker compose ps
-
-# Ver logs de um serviço
-docker compose logs -f api-gateway
-
-# Parar tudo
-docker compose down
+docker compose up --build -d # Construir e arrancar todos os serviços
+docker compose ps # Ver o estado dos contentores ativos
+docker compose logs -f api-gateway # Ver logs de um serviço
+docker compose down # Parar tudo
 ```
 
 | Serviço | URL |
@@ -85,8 +51,8 @@ docker compose down
 
 | Método | Endpoint | Descrição |
 |--------|----------|-----------|
-| GET | `/events` | Lista todos os eventos (encaminha para o Catalog) |
-| GET | `/events/{id}` | Detalhes de um evento (encaminha para o Catalog) |
+| GET | `/events` | Lista de todos os eventos |
+| GET | `/events/{id}` | Detalhes de um evento |
 | GET | `/metrics` | Métricas no formato Prometheus |
 
 ### Catalog (porta 8001)
@@ -94,7 +60,7 @@ docker compose down
 | Método | Endpoint | Descrição |
 |--------|----------|-----------|
 | GET | `/events` | Lista todos os eventos |
-| GET | `/events/{id}` | Detalhes de um evento (404 se não existir) |
+| GET | `/events/{id}` | Detalhes de um evento |
 | GET | `/metrics` | Métricas no formato Prometheus |
 
 ## Métricas
@@ -107,22 +73,20 @@ docker compose down
 | Catalog | `catalog_request_duration_seconds` | Histogram | — |
 
 ## Teste de carga (k6)
-
 O k6 está no profile `testing`, por isso não arranca com `docker compose up`.
 
 ```bash
 docker compose run --rm k6
 ```
-
 O teste sobe até 500 utilizadores virtuais em 3 minutos, mantém durante 2 minutos e desce em 30 segundos.
-Thresholds: p95 da latência < 200 ms e menos de 1% de pedidos falhados.
+Limites: p95 da latência < 200 ms e menos de 1% de pedidos falhados.
 
 ## Verificação rápida
 
 ```bash
 curl http://localhost:8000/events
 curl http://localhost:8000/events/evt-101
-curl http://localhost:8001/events/evt-999     # deve devolver 404
+curl http://localhost:8001/events/evt-999     # deve dar erro 404
 curl http://localhost:8000/metrics
 ```
 
@@ -130,6 +94,6 @@ No Prometheus, em http://localhost:9090/targets, os três targets (`api-gateway`
 
 ## Dashboard
 
-_Screenshot do dashboard durante o teste de carga:_
+TODO - Colocar screenshot
 
 <!-- ![Dashboard Grafana](docs/img/dashboard.png) -->

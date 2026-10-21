@@ -49,7 +49,7 @@ services:
       - ticketmei-net
 
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    image: ghcr.io/google/cadvisor:v0.60.6
     container_name: cadvisor
     privileged: true
     ports:

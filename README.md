@@ -16,7 +16,7 @@ Projeto da unidade curricular de **Sistemas Distribuídos** — Mestrado em Enge
 
 | Fase | Prazo      | Conteúdo                                                         | Estado      |
 | ---- | ---------- | ----------------------------------------------------------------- | ----------- |
-| 1    | 21/10/2026 | API Gateway + Catalog, Docker Compose, Prometheus, Grafana        | Em curso    |
+| 1    | 21/10/2026 | API Gateway + Catalog, Docker Compose, Prometheus, Grafana        | Falha http_req_duration > 200ms   |
 | 2    | 28/10/2026 | Order + Notification, RabbitMQ                                    | Por iniciar |
 | 3    | 04/11/2026 | Kubernetes, GitHub Actions + GHCR, ArgoCD, rate limiter com Redis | Por iniciar |
 

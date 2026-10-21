@@ -216,12 +216,12 @@ Thresholds: p95 da latência < 200 ms e menos de 1% de pedidos falhados.
 
 | Métrica | Resultado |
 |---------|-----------|
-| Pedidos totais | _preencher_ |
-| Débito médio | _preencher_ pedidos/s |
-| Latência p90 | _preencher_ ms |
-| Latência p95 | _preencher_ ms (threshold: < 200 ms) |
-| Pedidos falhados | _preencher_ % (threshold: < 1%) |
-| Máquina | _preencher (ex.: portátil, CPU, nº de cores atribuídos ao Docker)_ |
+| Pedidos totais | 512747 |
+| Débito médio | 1553.59 pedidos/s |
+| Latência p90 | 233.61 ms |
+| Latência p95 | 526.3 ms (threshold: < 200 ms) |
+| Pedidos falhados | 0.00 % (threshold: < 1%) |
+| Máquina | Laptop Ryzen 7 7735HS, 16 Cores|
 
 ![Resumo do k6](docs/img/k6-resumo.png)
 

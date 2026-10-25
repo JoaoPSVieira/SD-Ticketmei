@@ -29,6 +29,9 @@ EXPOSE 8001
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
 
-# --host 0.0.0.0: aceita ligações vindas de fora do contentor (127.0.0.1 só aceitaria do próprio contentor)
-# --no-access-log: uma linha de log por pedido custa muito desempenho com 500 utilizadores virtuais
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--no-access-log"]
+# Vários processos para usar vários cores; as métricas de todos são somadas no /metrics
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-metrics \
+    WEB_CONCURRENCY=2
+
+# Limpa a pasta das métricas a cada arranque e arranca o uvicorn com WEB_CONCURRENCY processos
+CMD ["sh", "-c", "rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\" && exec uvicorn main:app --host 0.0.0.0 --port 8001 --workers \"$WEB_CONCURRENCY\" --no-access-log"]

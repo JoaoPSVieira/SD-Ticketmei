@@ -22,7 +22,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Histogram, generate_latest, multiprocess
 from pydantic import BaseModel, TypeAdapter
 
 # ----------------
@@ -106,6 +106,17 @@ REQUEST_DURATION = Histogram(
 # Pedidos de infraestrutura que não contam como tráfego de clientes
 UNINSTRUMENTED_PATHS = {"/metrics", "/health"}
 
+# Com vários processos, cada um tem a sua própria memória. Quando PROMETHEUS_MULTIPROC_DIR está
+# definida, cada processo guarda as métricas em ficheiros nessa pasta e o /metrics soma-as todas
+MULTIPROCESS_MODE = bool(os.getenv("PROMETHEUS_MULTIPROC_DIR"))
+
+
+def collect_metrics() -> bytes:
+    if MULTIPROCESS_MODE:
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return generate_latest(registry)
+    return generate_latest()
 
 class MetricsMiddleware:
     """
@@ -188,4 +199,4 @@ async def health() -> dict:
 @app.get("/metrics", include_in_schema=False)
 async def metrics() -> Response:
     """Expõe as métricas para o Prometheus."""
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return Response(content=collect_metrics(), media_type=CONTENT_TYPE_LATEST)

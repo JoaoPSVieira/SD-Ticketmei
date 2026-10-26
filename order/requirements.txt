@@ -1,0 +1,5 @@
+fastapi==0.156.2
+uvicorn[standard]==0.54.0
+prometheus-client==0.26.0
+aiohttp==3.14.5
+aio-pika==10.2.1

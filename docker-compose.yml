@@ -77,3 +77,43 @@ services:
       - ticketmei-net
     profiles:
       - testing
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    environment:
+      # Utilizador usado pelo Order e pelo Notification
+      - RABBITMQ_DEFAULT_USER=ticketmei
+      - RABBITMQ_DEFAULT_PASS=ticketmei
+    ports:
+      - "5672:5672"     # Onde os serviços publicam e consomem mensagens
+      - "15672:15672"   # Interface web de gestão
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ticketmei-net
+
+  order:
+    build: ./order
+    container_name: order
+    environment:
+      - CATALOG_URL=http://catalog:8001
+      - RABBITMQ_URL=amqp://ticketmei:ticketmei@rabbitmq:5672/
+    ports:
+      - "8002:8002"
+    volumes:
+      - order-data:/app/data
+    depends_on:
+      catalog:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ticketmei-net
+
+volumes:
+  order-data:

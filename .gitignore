@@ -28,3 +28,6 @@ desktop.ini
 # Resultados de testes k6
 k6/*.json.out
 k6/summary*.json
+
+# BD local do Order
+order/data/

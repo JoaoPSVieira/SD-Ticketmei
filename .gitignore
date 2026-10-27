@@ -31,3 +31,6 @@ k6/summary*.json
 
 # BD local do Order
 order/data/
+
+# Log de entregas local do Notification (quando corrido sem Docker)
+notification/logs/

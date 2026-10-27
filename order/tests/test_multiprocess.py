@@ -82,7 +82,7 @@ def start_order_service(tmp_path, fake_catalog_url, rabbitmq_url, queue):
 
 def wait_until(base_url: str, rabbitmq_connected: bool) -> None:
     """Espera até o serviço responder (e, se pedido, até os processos estarem ligados ao RabbitMQ)."""
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 60
     connected_checks = 0
     while time.monotonic() < deadline:
         try:

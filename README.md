@@ -359,11 +359,11 @@ docker compose run --rm k6 run --stage 30s:200,60s:200,10s:0 orders-test.js
 
 | Métrica | Resultado |
 |---------|-----------|
-| Pedidos totais (POST + GET) | _preencher_ |
-| Compras criadas | _preencher_ |
-| Latência p95 (threshold: < 200 ms) | _preencher_ ms |
-| Pedidos falhados (threshold: < 1%) | _preencher_ % |
-| Compras na base de dados = notificações enviadas? | _preencher (ver o painel "Compras aceites" vs "Notificações enviadas")_ |
+| Pedidos totais (POST + GET) | 62084 |
+| Compras criadas | 31042 |
+| Latência p95 (threshold: < 200 ms) | 24.92 ms |
+| Pedidos falhados (threshold: < 1%) | 0.00 % |
+| Compras na base de dados = notificações enviadas? | Sim (47 Mil (Realizados 2 Testes)) |
 
 ![Resumo do k6 das compras](docs/img/k6-compras.png)
 

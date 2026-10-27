@@ -41,6 +41,10 @@ jobs:
       run:
         working-directory: ${{ matrix.service }}
 
+    # 127.0.0.1 explícito: nas máquinas do GitHub "localhost" resolve primeiro para IPv6 (::1)
+    env:
+      RABBITMQ_TEST_URL: amqp://ticketmei:ticketmei@127.0.0.1:5672/
+
     steps:
       - uses: actions/checkout@v5
 

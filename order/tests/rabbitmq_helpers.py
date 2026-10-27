@@ -6,8 +6,10 @@ import os
 
 import aio_pika
 
-# RabbitMQ usado nos testes de integração (o do docker compose, se estiver a correr)
-RABBITMQ_TEST_URL = os.getenv("RABBITMQ_TEST_URL", "amqp://ticketmei:ticketmei@localhost:5672/")
+# RabbitMQ usado nos testes de integração (o do docker compose, se estiver a correr).
+# 127.0.0.1 e não "localhost": em algumas máquinas (GitHub Actions, Windows) "localhost" resolve
+# primeiro para o endereço IPv6 ::1, e a porta publicada pelo Docker pode não responder por IPv6.
+RABBITMQ_TEST_URL = os.getenv("RABBITMQ_TEST_URL", "amqp://ticketmei:ticketmei@127.0.0.1:5672/")
 
 
 def rabbitmq_available() -> bool:

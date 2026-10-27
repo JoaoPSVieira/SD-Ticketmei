@@ -72,17 +72,28 @@ def start_order_service(tmp_path, fake_catalog_url, rabbitmq_url, queue):
         "RABBITMQ_URL": rabbitmq_url,
         "ORDER_QUEUE": queue,
     }
+    # O log do Order fica num ficheiro, para ser mostrado se o teste falhar
+    log_file = open(tmp_path / "order.log", "w")
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port),
          "--workers", str(WORKERS), "--no-access-log"],
-        cwd=SERVICE_DIR, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=SERVICE_DIR, env=env, stdout=log_file, stderr=subprocess.STDOUT,
     )
+    process.log_path = tmp_path / "order.log"
     return process, f"http://127.0.0.1:{port}"
 
 
-def wait_until(base_url: str, rabbitmq_connected: bool) -> None:
+def order_log_tail(process, lines: int = 40) -> str:
+    """Últimas linhas do log do Order (para perceber porque é que não ficou pronto)."""
+    try:
+        return "\n".join(process.log_path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "(sem log)"
+
+
+def wait_until(process, base_url: str, rabbitmq_connected: bool) -> None:
     """Espera até o serviço responder (e, se pedido, até os processos estarem ligados ao RabbitMQ)."""
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + 30
     connected_checks = 0
     while time.monotonic() < deadline:
         try:
@@ -96,7 +107,10 @@ def wait_until(base_url: str, rabbitmq_connected: bool) -> None:
         except OSError:
             pass
         time.sleep(0.2)
-    pytest.fail("O Order não ficou pronto com vários processos")
+    pytest.fail(
+        f"O Order não ficou pronto com vários processos "
+        f"(RabbitMQ esperado: {rabbitmq_connected}). Últimas linhas do log do Order:\n{order_log_tail(process)}"
+    )
 
 
 def create_orders_concurrently(base_url: str) -> list[tuple[int, dict]]:
@@ -110,7 +124,7 @@ def test_workers_share_the_database_and_metrics(tmp_path, fake_catalog_url):
         tmp_path, fake_catalog_url, f"amqp://ticketmei:ticketmei@127.0.0.1:{free_port()}/", "nao_usada"
     )
     try:
-        wait_until(base_url, rabbitmq_connected=False)
+        wait_until(process, base_url, rabbitmq_connected=False)
         results = create_orders_concurrently(base_url)
 
         assert [status for status, _ in results] == [503] * ORDERS
@@ -134,7 +148,7 @@ def test_workers_publish_one_message_per_order(tmp_path, fake_catalog_url):
     queue = f"test_order_created_{uuid.uuid4().hex[:8]}"
     process, base_url = start_order_service(tmp_path, fake_catalog_url, RABBITMQ_TEST_URL, queue)
     try:
-        wait_until(base_url, rabbitmq_connected=True)
+        wait_until(process, base_url, rabbitmq_connected=True)
         results = create_orders_concurrently(base_url)
 
         assert [status for status, _ in results] == [202] * ORDERS

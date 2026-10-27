@@ -81,6 +81,7 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management
     container_name: rabbitmq
+    hostname: rabbitmq 
     environment:
       # Utilizador usado pelo Order e pelo Notification
       - RABBITMQ_DEFAULT_USER=ticketmei
@@ -88,6 +89,7 @@ services:
     ports:
       - "5672:5672"     # Onde os serviços publicam e consomem mensagens
       - "15672:15672"   # Interface web de gestão
+      - "15692:15692"   # Métricas Prometheus: http://localhost:15692/metrics
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -115,5 +117,26 @@ services:
     networks:
       - ticketmei-net
 
+  notification:
+    build: ./notification
+    container_name: notification
+    environment:
+      - RABBITMQ_URL=amqp://ticketmei:ticketmei@rabbitmq:5672/
+      # Mensagens tratadas em paralelo (com 100 ms por email, 10 dá ~100 notificações/s)
+      - PREFETCH_COUNT=10
+      # Percentagem de envios que falham de propósito (0 a 1); 0.1 = 10%, para mostrar FAILED nos dashboards
+      - NOTIFICATION_FAILURE_RATE=0
+    ports:
+      - "8003:8003"
+    volumes:
+      # Log de entregas (uma linha JSON por notificação): sobrevive a reinícios do contentor
+      - notification-logs:/app/logs
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ticketmei-net  
+
 volumes:
   order-data:
+  notification-logs:

@@ -97,3 +97,13 @@ jobs:
       - name: Parar e limpar
         if: always()
         run: docker compose down -v
+
+      - name: Parar e limpar
+        if: always()
+        run: docker compose down -v
+
+  # Fase 3: valida os manifestos Kubernetes contra os esquemas oficiais (incluindo a Application do
+  # Argo CD). Um erro num YAML é apanhado no Pull Request, antes de chegar ao main e ao Argo CD.
+  k8s:
+    name: Manifestos Kubernetes
+    runs-on: ubuntu-latest  

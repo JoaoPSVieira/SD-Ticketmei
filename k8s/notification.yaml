@@ -1,0 +1,120 @@
+# Notification: consome as mensagens OrderCreated da fila e "envia" o email de confirmação.
+
+# Disco persistente para o log de entregas (equivale ao volume notification-logs do compose)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notification-logs
+  namespace: ticketmei
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  namespace: ticketmei
+  labels:
+    app: notification
+spec:
+  replicas: 1
+  # Durante a troca há dois consumidores durante alguns segundos: repartem as mensagens da fila
+  # entre si (competing consumers), por isso nenhuma se perde nem é tratada duas vezes
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: notification
+  template:
+    metadata:
+      labels:
+        app: notification
+    spec:
+      enableServiceLinks: false
+      # Como no Order: dá a pasta do disco ao appuser (uid 10001) antes de o serviço arrancar
+      initContainers:
+        - name: permissoes-logs
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 10001:10001 /app/logs"]
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+      containers:
+        - name: notification
+          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          image: ghcr.io/joaopsvieira/ticketmei-notification:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: username
+            - name: RABBITMQ_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: password
+            - name: RABBITMQ_URL
+              value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASS)@rabbitmq:5672/
+            - name: NOTIFICATIONS_LOG_PATH
+              value: /app/logs/notifications.log
+            # Mensagens tratadas em paralelo (com 100 ms por email, 10 dá ~100 notificações/s)
+            - name: PREFETCH_COUNT
+              value: "10"
+            # Percentagem de envios que falham de propósito (0 a 1); 0.1 = 10%
+            - name: NOTIFICATION_FAILURE_RATE
+              value: "0"
+          ports:
+            - name: http
+              containerPort: 8003
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: notification-logs
+---
+# Não recebe pedidos dos clientes; o Service existe para o Prometheus ler o /metrics (notification:8003)
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification
+  namespace: ticketmei
+  labels:
+    app: notification
+spec:
+  selector:
+    app: notification
+  ports:
+    - name: http
+      port: 8003
+      targetPort: http

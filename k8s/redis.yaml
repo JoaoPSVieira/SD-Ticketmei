@@ -1,0 +1,60 @@
+# Redis: guarda os contadores do rate limiter do API Gateway (fase 3).
+# Os contadores só interessam durante alguns segundos, por isso não há disco persistente
+# (--save "" e --appendonly no desligam a gravação em disco).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: ticketmei
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+# O Gateway liga-se a redis:6379 (REDIS_URL=redis://redis:6379/0). Só é acessível dentro do cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ticketmei
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

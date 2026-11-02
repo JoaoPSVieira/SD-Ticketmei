@@ -1,0 +1,36 @@
+# Aplicação do Argo CD: diz ao Argo CD para manter o cluster igual à pasta k8s/ do ramo main.
+#
+# Aplica-se uma única vez, depois de instalar o Argo CD:
+#   kubectl apply -f argocd/application.yaml
+#
+# Este ficheiro fica fora da pasta k8s/ de propósito: é a configuração do próprio Argo CD,
+# não faz parte da aplicação que ele sincroniza.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ticketmei
+  namespace: argocd
+spec:
+  project: default
+
+  # De onde vem a configuração: pasta k8s/ do ramo main do repositório
+  source:
+    repoURL: https://github.com/JoaoPSVieira/SD-Ticketmei.git
+    targetRevision: main
+    path: k8s
+    directory:
+      recurse: true # inclui as subpastas (por exemplo k8s/monitoring/, da pessoa B)
+
+  # Para onde vai: o próprio cluster onde o Argo CD está instalado, namespace ticketmei
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ticketmei
+
+  syncPolicy:
+    # Sincronização automática: cada commit no main que altere k8s/ é aplicado sem kubectl apply
+    automated:
+      prune: true    # o que for apagado do Git é apagado do cluster
+      selfHeal: true # o que for alterado à mão no cluster é reposto como está no Git
+    syncOptions:
+      - CreateNamespace=true

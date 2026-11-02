@@ -1,0 +1,24 @@
+# Recursos partilhados por todos os serviços do TicketMEI.
+# O nome começa por "00-" para que "kubectl apply -f k8s/ --recursive" (que lê os ficheiros por
+# ordem alfabética) crie primeiro o namespace e as credenciais. O Argo CD ordena sozinho.
+
+# Namespace: o "espaço" onde ficam todos os recursos do projeto (fica separado do resto do cluster)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ticketmei
+---
+# Credenciais do RabbitMQ, usadas pelo próprio RabbitMQ (cria o utilizador no primeiro arranque),
+# pelo Order e pelo Notification (para montarem o RABBITMQ_URL).
+# Os valores estão em base64, que é só uma codificação e não uma encriptação ("dGlja2V0bWVp" é
+# "ticketmei"). Num projeto real as credenciais não ficariam no Git (usar-se-ia, por exemplo,
+# Sealed Secrets); aqui ficam para o Argo CD conseguir criar tudo a partir do repositório.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-credentials
+  namespace: ticketmei
+type: Opaque
+data:
+  username: dGlja2V0bWVp
+  password: dGlja2V0bWVp

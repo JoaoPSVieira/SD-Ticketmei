@@ -1,0 +1,86 @@
+# Catalog: lista de eventos (GET /events e GET /events/{id}). Sem estado: os eventos vêm do
+# ficheiro data/events.json que está dentro da imagem.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: ticketmei
+  labels:
+    app: catalog
+spec:
+  replicas: 1
+  # Rolling update sem interrupção: o pod novo arranca e só depois de estar pronto (readinessProbe)
+  # é que o antigo é parado. maxUnavailable 0 = nunca fica sem nenhum pod a responder.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: catalog
+  template:
+    metadata:
+      labels:
+        app: catalog
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: catalog
+          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          image: ghcr.io/joaopsvieira/ticketmei-catalog:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WEB_CONCURRENCY
+              value: "2"
+          ports:
+            - name: http
+              containerPort: 8001
+          # Pronto: só recebe pedidos depois de o /health responder
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Vivo: se o /health deixar de responder durante ~50 s, o Kubernetes reinicia o contentor
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          # Antes de o contentor parar (rolling update, reinício), espera 5 s com o serviço ainda a
+          # responder: dá tempo ao Kubernetes de deixar de enviar pedidos novos para este pod, e assim
+          # nenhum pedido é perdido durante a troca
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+---
+# Nome "catalog" no DNS do cluster (http://catalog:8001). Só é acessível dentro do cluster:
+# os clientes passam sempre pelo API Gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  namespace: ticketmei
+  labels:
+    app: catalog
+spec:
+  selector:
+    app: catalog
+  ports:
+    - name: http
+      port: 8001
+      targetPort: http

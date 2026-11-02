@@ -1,0 +1,115 @@
+# RabbitMQ: o broker de mensagens entre o Order (publica) e o Notification (consome).
+# Equivale ao serviço "rabbitmq" do docker-compose.yml.
+
+# Disco persistente: as filas duráveis e as mensagens persistentes sobrevivem a reinícios do pod
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-data
+  namespace: ticketmei
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: ticketmei
+  labels:
+    app: rabbitmq
+spec:
+  replicas: 1
+  # Recreate: o pod antigo para antes de o novo arrancar. Dois RabbitMQ a usar a mesma pasta de
+  # dados ao mesmo tempo corromperiam os dados (os serviços sem estado usam RollingUpdate).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      # Nome fixo, como o "hostname: rabbitmq" do compose. O RabbitMQ guarda os dados numa pasta com
+      # o nome da máquina (rabbit@rabbitmq); com o nome aleatório do pod, cada reinício começaria do zero.
+      hostname: rabbitmq
+      # Não injetar as variáveis antigas de "service links" (RABBITMQ_PORT=tcp://..., etc.):
+      # os serviços encontram-se pelo DNS do Kubernetes (rabbitmq, order, catalog, ...)
+      enableServiceLinks: false
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: username
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: password
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: management
+              containerPort: 15672
+            - name: prometheus
+              containerPort: 15692
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+          # Pronto a receber tráfego quando a porta AMQP aceita ligações
+          readinessProbe:
+            tcpSocket:
+              port: amqp
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          # Vivo: o mesmo comando do healthcheck do compose. Se falhar 3 vezes seguidas, é reiniciado.
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rabbitmq-data
+---
+# Nome "rabbitmq" no DNS do cluster: o Order e o Notification ligam-se a rabbitmq:5672.
+# Tipo LoadBalancer: no Docker Desktop as portas ficam também em localhost
+# (interface web em http://localhost:15672, utilizador e palavra-passe ticketmei).
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: ticketmei
+  labels:
+    app: rabbitmq
+spec:
+  type: LoadBalancer
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: amqp
+    - name: management
+      port: 15672
+      targetPort: management
+    - name: prometheus
+      port: 15692
+      targetPort: prometheus

@@ -17,10 +17,15 @@ services:
     environment:
       - CATALOG_URL=http://catalog:8001
       - CATALOG_TIMEOUT_SECONDS=2
+      # Encaminhamento das compras para o Order
+      - ORDER_URL=http://order:8002
+      - ORDER_TIMEOUT_SECONDS=5
     ports:
       - "8000:8000"
     depends_on:
       catalog:
+        condition: service_healthy
+      order:
         condition: service_healthy
     networks:
       - ticketmei-net

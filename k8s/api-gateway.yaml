@@ -1,0 +1,95 @@
+# API Gateway: a única porta de entrada dos clientes. Encaminha /events para o Catalog e
+# /orders para o Order. Na fase 3 aplica também o rate limiter (com o Redis).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: ticketmei
+  labels:
+    app: api-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: api-gateway
+          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          image: ghcr.io/joaopsvieira/ticketmei-api-gateway:local
+          imagePullPolicy: IfNotPresent
+          env:
+            # Os outros serviços são encontrados pelo nome do Service (DNS do Kubernetes)
+            - name: CATALOG_URL
+              value: http://catalog:8001
+            - name: CATALOG_TIMEOUT_SECONDS
+              value: "2"
+            - name: ORDER_URL
+              value: http://order:8002
+            - name: ORDER_TIMEOUT_SECONDS
+              value: "5"
+            # Redis do rate limiter (usado pelo código da pessoa C)
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: WEB_CONCURRENCY
+              value: "4"
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          # Antes de o contentor parar (rolling update, reinício), espera 5 s com o serviço ainda a
+          # responder: dá tempo ao Kubernetes de deixar de enviar pedidos novos para este pod, e assim
+          # nenhum pedido é perdido durante a troca
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+# Tipo LoadBalancer: no Docker Desktop o Gateway fica em http://localhost:8000, como no compose.
+# Dentro do cluster (por exemplo, para o k6) o endereço é http://api-gateway:8000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: ticketmei
+  labels:
+    app: api-gateway
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

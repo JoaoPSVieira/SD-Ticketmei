@@ -1,0 +1,132 @@
+# Order: cria compras (POST /orders), guarda-as em SQLite e publica OrderCreated no RabbitMQ.
+
+# Disco persistente para a base de dados SQLite (equivale ao volume order-data do compose)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: order-data
+  namespace: ticketmei
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order
+  namespace: ticketmei
+  labels:
+    app: order
+spec:
+  replicas: 1
+  # Rolling update sem interrupção. Durante alguns segundos o pod novo e o antigo usam o mesmo
+  # ficheiro SQLite, o que funciona porque estão no mesmo nó (o Docker Desktop só tem um) e o
+  # SQLite em modo WAL aceita vários processos (já acontece com os 2 workers do uvicorn).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: order
+  template:
+    metadata:
+      labels:
+        app: order
+    spec:
+      enableServiceLinks: false
+      # Corre antes do serviço, como root, só para dar a pasta do disco ao appuser (uid 10001).
+      # O disco novo pertence ao root, e o Order corre sem privilégios: sem isto não conseguiria
+      # criar o ficheiro orders.db.
+      initContainers:
+        - name: permissoes-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 10001:10001 /app/data"]
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      containers:
+        - name: order
+          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          image: ghcr.io/joaopsvieira/ticketmei-order:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CATALOG_URL
+              value: http://catalog:8001
+            # O Kubernetes substitui $(RABBITMQ_USER) e $(RABBITMQ_PASS) pelos valores das variáveis
+            # definidas acima, que vêm do Secret rabbitmq-credentials (ficheiro 00-base.yaml)
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: username
+            - name: RABBITMQ_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-credentials
+                  key: password
+            - name: RABBITMQ_URL
+              value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASS)@rabbitmq:5672/
+            - name: ORDERS_DB_PATH
+              value: /app/data/orders.db
+            - name: WEB_CONCURRENCY
+              value: "2"
+          ports:
+            - name: http
+              containerPort: 8002
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          # O /health responde 200 mesmo sem RabbitMQ (mostra "rabbitmq": "disconnected"):
+          # se o RabbitMQ cair, o Order não é reiniciado sem necessidade e volta a ligar-se sozinho
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          # Antes de o contentor parar (rolling update, reinício), espera 5 s com o serviço ainda a
+          # responder: dá tempo ao Kubernetes de deixar de enviar pedidos novos para este pod, e assim
+          # nenhum pedido é perdido durante a troca
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: order-data
+---
+# Nome "order" no DNS do cluster (http://order:8002). O Gateway encaminha para aqui.
+apiVersion: v1
+kind: Service
+metadata:
+  name: order
+  namespace: ticketmei
+  labels:
+    app: order
+spec:
+  selector:
+    app: order
+  ports:
+    - name: http
+      port: 8002
+      targetPort: http

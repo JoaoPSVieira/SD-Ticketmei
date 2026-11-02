@@ -1,0 +1,30 @@
+# Teste de carga k6 da fase 1 (GET /events, até 500 utilizadores virtuais), a correr dentro do
+# cluster, tal como o contentor k6 corria dentro da rede do compose.
+#
+# Fica fora da pasta k8s/ de propósito: um Job corre uma vez e termina, e o Argo CD não o deve
+# voltar a correr a cada sincronização. Corre-se à mão com:   .\k8s-tools\k6.ps1 eventos
+#
+# Os scripts vêm do ConfigMap k6-scripts, criado pelo k6.ps1 a partir da pasta k6/.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-eventos
+  namespace: ticketmei
+spec:
+  backoffLimit: 0 # se os thresholds falharem, não repete o teste
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.49.0
+          # O script usa http://api-gateway:8000, que é o nome do Service do Gateway no cluster
+          args: ["run", "/scripts/load-test.js"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-scripts

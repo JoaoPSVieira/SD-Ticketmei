@@ -1,0 +1,19 @@
+
+  # Fase 3: valida os manifestos Kubernetes contra os esquemas oficiais (incluindo a Application do
+  # Argo CD). Um erro num YAML é apanhado no Pull Request, antes de chegar ao main e ao Argo CD.
+  k8s:
+    name: Manifestos Kubernetes
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Instalar o kubeconform
+        run: curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz kubeconform
+
+      - name: Validar os manifestos
+        run: >-
+          ./kubeconform -strict -summary -kubernetes-version 1.33.0
+          -schema-location default
+          -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          k8s/ k8s-tools/ argocd/

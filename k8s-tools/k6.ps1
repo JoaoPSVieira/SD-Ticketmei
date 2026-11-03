@@ -3,10 +3,11 @@
 # Uso (na raiz do repositório):
 #   .\k8s-tools\k6.ps1 eventos    -> k6/load-test.js   (GET /events, até 500 utilizadores virtuais, ~5,5 min)
 #   .\k8s-tools\k6.ps1 compras    -> k6/orders-test.js (POST e GET /orders, 50 utilizadores virtuais, ~3,5 min)
+#   .\k8s-tools\k6.ps1 limite     -> k6/rate-limit-test.js (um cliente a tentar 20 compras/s durante 30 s: 429)
 
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("eventos", "compras")]
+    [ValidateSet("eventos", "compras", "limite")]
     [string]$Teste
 )
 

@@ -1,5 +1,6 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
+import { Counter } from 'k6/metrics';
 
 // Teste de carga das compras (fase 2).
 // Cada utilizador virtual cria uma compra através do Gateway (POST /orders) e consulta-a logo a seguir
@@ -8,6 +9,17 @@ import { check, sleep } from 'k6';
 // Correr (com o docker compose a correr):   docker compose run --rm k6 run orders-test.js
 // Com mais carga, para ver a fila do RabbitMQ a crescer:
 //   docker compose run --rm k6 run --stage 30s:200,60s:200,10s:0 orders-test.js
+//
+// Fase 3: no Kubernetes o Gateway tem um rate limiter (5 compras/s por cliente) e todos os
+// utilizadores virtuais vêm do mesmo IP (o pod do k6). Por isso a maior parte das compras recebe
+// 429, o que é a resposta certa e não uma falha. No compose não há rate limiter: são todas 202.
+// O resumo do k6 mostra quantas foram aceites e quantas foram limitadas.
+
+// 429 é uma resposta esperada: não conta para http_req_failed
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 429));
+
+const acceptedOrders = new Counter('compras_aceites');
+const limitedOrders = new Counter('compras_limitadas_429');
 
 export const options = {
   stages: [
@@ -40,6 +52,16 @@ export default function () {
     headers: HEADERS,
     tags: { name: 'POST /orders' },
   });
+
+  if (created.status === 429) {
+    // Limitada pelo rate limiter: o Gateway tem de dizer quando se pode tentar outra vez
+    limitedOrders.add(1);
+    check(created, { 'limite com Retry-After (429)': (r) => r.headers['Retry-After'] !== undefined });
+    sleep(0.5);
+    return;
+  }
+
+  acceptedOrders.add(1);
   const accepted = check(created, {
     'compra aceite (202)': (r) => r.status === 202,
     'compra no estado PENDING': (r) => r.status === 202 && r.json('status') === 'PENDING',

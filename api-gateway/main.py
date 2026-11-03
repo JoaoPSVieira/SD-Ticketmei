@@ -6,7 +6,7 @@ responsável, de forma síncrona (o cliente espera pela resposta do serviço):
 
     GET  /events           -> Catalog  {CATALOG_URL}/events
     GET  /events/{id}      -> Catalog  {CATALOG_URL}/events/{id}
-    POST /orders           -> Order    {ORDER_URL}/orders          (fase 2)
+    POST /orders           -> Order    {ORDER_URL}/orders          (fase 2; limite de pedidos por IP na fase 3)
     GET  /orders/{id}      -> Order    {ORDER_URL}/orders/{id}     (fase 2)
     GET  /health           -> estado do próprio Gateway (healthcheck do Docker; probes do Kubernetes na fase 3)
     GET  /metrics          -> métricas no formato Prometheus
@@ -22,6 +22,11 @@ Tratamento de falhas dos serviços:
     O serviço responde outro 5xx (ex.: 500, um erro inesperado) -> 502 Bad Gateway
     O serviço está inacessível            -> 502 Bad Gateway
     O serviço não responde a tempo        -> 504 Gateway Timeout
+
+Rate limiter (fase 3):
+    POST /orders tem um limite de pedidos por cliente (IP), guardado no Redis (ver rate_limiter.py).
+    Acima do limite, o Gateway responde 429 Too Many Requests sem chamar o Order.
+    Só fica ativo se REDIS_URL estiver definida (no Kubernetes está; no Docker Compose não).
 
 Vários processos:
     No contentor, o uvicorn arranca vários processos (WEB_CONCURRENCY) para usar vários cores.
@@ -47,6 +52,8 @@ from prometheus_client import (
     multiprocess,
 )
 
+from rate_limiter import Decision, RateLimiter
+
 # ---------------------------------------------------------------------------
 # Configuração (por variáveis de ambiente, para não mudar código entre ambientes)
 # ---------------------------------------------------------------------------
@@ -70,6 +77,13 @@ ORDER_TIMEOUT_SECONDS = float(os.getenv("ORDER_TIMEOUT_SECONDS", "5"))
 
 # Número máximo de ligações TCP abertas em simultâneo para cada serviço (reutilizadas entre pedidos).
 UPSTREAM_MAX_CONNECTIONS = int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100"))
+
+# Rate limiter do POST /orders (fase 3). Sem REDIS_URL fica desligado (é o caso do Docker Compose).
+# RATE_LIMIT_PER_SECOND: pedidos por segundo que cada cliente pode fazer, em média
+# RATE_LIMIT_BURST: pedidos seguidos que um cliente pode fazer de uma vez (capacidade do balde)
+REDIS_URL = os.getenv("REDIS_URL", "")
+RATE_LIMIT_PER_SECOND = float(os.getenv("RATE_LIMIT_PER_SECOND", "5"))
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "5"))
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +181,20 @@ async def lifespan(app: FastAPI):
         "A encaminhar pedidos para o Catalog em %s (timeout %.1fs) e para o Order em %s (timeout %.1fs)",
         CATALOG_URL, CATALOG_TIMEOUT_SECONDS, ORDER_URL, ORDER_TIMEOUT_SECONDS,
     )
+
+    # Rate limiter (fase 3): um cliente Redis por processo, todos a partilhar os mesmos baldes
+    app.state.rate_limiter = None
+    if REDIS_URL:
+        app.state.rate_limiter = RateLimiter(REDIS_URL, RATE_LIMIT_PER_SECOND, RATE_LIMIT_BURST)
+        logger.info("Rate limiter ativo em POST /orders: %g pedidos/s por cliente, rajadas até %d (Redis em %s)",
+                    RATE_LIMIT_PER_SECOND, RATE_LIMIT_BURST, REDIS_URL)
+    else:
+        logger.info("Rate limiter desligado (REDIS_URL não definida)")
+
     yield
     await app.state.http.close()
+    if app.state.rate_limiter is not None:
+        await app.state.rate_limiter.close()
 
 
 # Respostas 5xx que o serviço devolve de propósito, a explicar o que falhou: passam tal como vêm
@@ -231,7 +257,7 @@ def error_response(status_code: int, detail: str) -> JSONResponse:
 app = FastAPI(
     title="TicketMEI - API Gateway",
     description="Ponto de entrada único da plataforma TicketMEI.",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(MetricsMiddleware)
@@ -294,12 +320,37 @@ ORDER_REQUEST_DOC = {
         202: {"description": "Compra aceite (PENDING); a confirmação por email é enviada depois"},
         422: {"description": "Pedido inválido ou evento inexistente"},
         503: {"description": "Sistema de mensagens indisponível: a compra ficou FAILED"},
+        429: {"description": "Demasiados pedidos deste cliente (rate limiter); ver o cabeçalho Retry-After"},
         **upstream_errors("Order"),
     },
 )
 async def create_order(request: Request) -> Response:
-    """Cria uma compra de bilhetes (encaminhado para o Order)."""
-    return await forward(request, "Order", f"{ORDER_URL}/orders", ORDER_TIMEOUT_SECONDS)
+    """Cria uma compra de bilhetes (encaminhado para o Order), com limite de pedidos por cliente."""
+    decision = await check_rate_limit(request)
+
+    if decision is not None and not decision.allowed:
+        # Recusado aqui, sem chegar ao Order: é isto que protege o resto do sistema
+        response = error_response(429, "Demasiados pedidos. Tente novamente daqui a alguns segundos.")
+    else:
+        response = await forward(request, "Order", f"{ORDER_URL}/orders", ORDER_TIMEOUT_SECONDS)
+
+    if decision is not None:
+        response.headers.update(decision.headers())
+    return response
+
+
+async def check_rate_limit(request: Request) -> Decision | None:
+    """
+    Verifica o limite do cliente que fez o pedido. Devolve None quando não há verificação:
+    rate limiter desligado (sem REDIS_URL) ou Redis indisponível (o pedido passa).
+
+    O cliente é identificado pelo IP de onde vem a ligação. Não se usa o cabeçalho X-Forwarded-For
+    porque qualquer cliente o pode inventar para fugir ao limite.
+    """
+    limiter: RateLimiter | None = request.app.state.rate_limiter
+    if limiter is None or request.client is None:
+        return None
+    return await limiter.check(request.client.host)
 
 
 @app.get("/orders/{order_id}", responses={404: {"description": "Compra não encontrada"}, **upstream_errors("Order")})

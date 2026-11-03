@@ -1,0 +1,97 @@
+# cAdvisor: CPU, memória e rede de cada contentor. É o mesmo cAdvisor do compose (mesma imagem e
+# mesmas pastas do nó), agora como DaemonSet: o Kubernetes corre um pod destes em cada nó do
+# cluster (no Docker Desktop há só um nó, por isso há só um pod).
+#
+# No Kubernetes do Docker Desktop (modo kubeadm) os pods são contentores Docker, e cada um tem as
+# labels io.kubernetes.pod.namespace, io.kubernetes.pod.name e io.kubernetes.container.name.
+# O cAdvisor mostra-as nas métricas (container_label_io_kubernetes_...), e é por elas que os
+# dashboards sabem a que serviço e a que pod pertence cada contentor.
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cadvisor
+  namespace: ticketmei
+  labels:
+    app: cadvisor
+spec:
+  selector:
+    matchLabels:
+      app: cadvisor
+  template:
+    metadata:
+      labels:
+        app: cadvisor
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      containers:
+        - name: cadvisor
+          image: ghcr.io/google/cadvisor:v0.60.6
+          ports:
+            - name: http
+              containerPort: 8080
+          # Como o "privileged: true" do compose: precisa de ler os cgroups e o Docker do nó
+          securityContext:
+            privileged: true
+          # As mesmas pastas do nó que o compose montava (só de leitura)
+          volumeMounts:
+            - name: rootfs
+              mountPath: /rootfs
+              readOnly: true
+            - name: var-run
+              mountPath: /var/run
+              readOnly: true
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: docker
+              mountPath: /var/lib/docker
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: rootfs
+          hostPath:
+            path: /
+        - name: var-run
+          hostPath:
+            path: /var/run
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: docker
+          hostPath:
+            path: /var/lib/docker
+---
+# O Prometheus recolhe as métricas em cadvisor:8080, como no compose. Só dentro do cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cadvisor
+  namespace: ticketmei
+  labels:
+    app: cadvisor
+spec:
+  selector:
+    app: cadvisor
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

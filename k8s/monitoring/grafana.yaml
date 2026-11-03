@@ -1,0 +1,92 @@
+# Grafana: dashboards da pasta TicketMEI, com o Prometheus como fonte de dados.
+# Usa os mesmos ficheiros do compose (grafana/provisioning/ e grafana/dashboards/), que chegam ao
+# pod por três ConfigMaps gerados pelo k8s-tools/gerar-configmaps.py (ver configmaps.yaml).
+# Utilizador admin, password admin (como no compose; o Grafana pede para a mudar no 1.º login).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: ticketmei
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+      annotations:
+        # Resumo (hash) da fonte de dados, do fornecedor de dashboards e dos dashboards, escrito pelo
+        # k8s-tools/gerar-configmaps.py. Se algum mudar, o pod é recriado com a versão nova.
+        ticketmei/config-hash: "a06bc59ee4cc"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: grafana
+          image: grafana/grafana:10.3.1
+          ports:
+            - name: http
+              containerPort: 3000
+          # Os mesmos caminhos do compose
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-providers
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        # Base de dados interna do Grafana (utilizadores, preferências): dura enquanto o pod existir.
+        # Os dashboards e a fonte de dados não se perdem, porque vêm sempre dos ConfigMaps.
+        - name: data
+          emptyDir: {}
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-providers
+          configMap:
+            name: grafana-dashboard-providers
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+---
+# No Docker Desktop fica em http://localhost:3000
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: ticketmei
+  labels:
+    app: grafana
+spec:
+  type: LoadBalancer
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

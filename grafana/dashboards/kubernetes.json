@@ -1,0 +1,722 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m"
+    ]
+  },
+  "timezone": "browser",
+  "title": "TicketMei - Kubernetes",
+  "uid": "ticketmei-kubernetes",
+  "version": 1,
+  "weekStart": "",
+  "description": "Fase 3: pods, CPU e memória no cluster (cAdvisor) e rate limiter do Gateway.",
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "unitScale": true,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(up)",
+          "legendFormat": "Alvos do Prometheus a responder",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Alvos do Prometheus a responder",
+      "type": "stat",
+      "description": "Número de alvos do Prometheus com up = 1 (serviços, RabbitMQ e cAdvisor). Status -> Targets no Prometheus mostra o detalhe."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short",
+          "unitScale": true,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "count(up == 0) or vector(0)",
+          "legendFormat": "Alvos do Prometheus em baixo",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Alvos do Prometheus em baixo",
+      "type": "stat",
+      "description": "Alvos que o Prometheus não consegue ler. Deve ser 0."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "unitScale": true,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "count(container_memory_working_set_bytes{container_label_io_kubernetes_pod_namespace=\"ticketmei\", container_label_io_kubernetes_container_name!~\"POD|\"})",
+          "legendFormat": "Pods do TicketMEI a correr",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pods do TicketMEI a correr",
+      "type": "stat",
+      "description": "Contentores a correr no namespace ticketmei (um por pod, mais os initContainers enquanto correm)."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short",
+          "unitScale": true,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(gateway_requests_total{http_status=\"429\"}[$__range])) or vector(0)",
+          "legendFormat": "Pedidos rejeitados pelo rate limiter (429)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pedidos rejeitados pelo rate limiter (429)",
+      "type": "stat",
+      "description": "Respostas 429 do Gateway no intervalo de tempo do dashboard."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short",
+          "unitScale": true,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "count by (container_label_io_kubernetes_container_name) (container_memory_working_set_bytes{container_label_io_kubernetes_pod_namespace=\"ticketmei\", container_label_io_kubernetes_container_name!~\"POD|\"})",
+          "legendFormat": "{{container_label_io_kubernetes_container_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pods a correr por serviço",
+      "type": "timeseries",
+      "description": "Durante um rolling update, o serviço tem 2 pods durante alguns segundos: o novo arranca e só depois o antigo termina."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "reqps",
+          "unitScale": true
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(gateway_requests_total{method=\"POST\", endpoint=\"/orders\", http_status!=\"429\"}[1m]))",
+          "legendFormat": "Aceites",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(gateway_requests_total{method=\"POST\", endpoint=\"/orders\", http_status=\"429\"}[1m]))",
+          "legendFormat": "Rejeitados (429)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Rate limiter: POST /orders aceites vs rejeitados (/s)",
+      "type": "timeseries",
+      "description": "Pedidos de compra que passaram o rate limiter e os que receberam 429 (limite por IP do cliente)."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent",
+          "unitScale": true
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum by (container_label_io_kubernetes_pod_name) (rate(container_cpu_usage_seconds_total{container_label_io_kubernetes_pod_namespace=\"ticketmei\", container_label_io_kubernetes_container_name!~\"POD|\"}[1m])) * 100",
+          "legendFormat": "{{container_label_io_kubernetes_pod_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "CPU por pod (%)",
+      "type": "timeseries",
+      "description": "Uso de CPU de cada pod (100% = um core inteiro)."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes",
+          "unitScale": true
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum by (container_label_io_kubernetes_pod_name) (container_memory_working_set_bytes{container_label_io_kubernetes_pod_namespace=\"ticketmei\", container_label_io_kubernetes_container_name!~\"POD|\"})",
+          "legendFormat": "{{container_label_io_kubernetes_pod_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Memória por pod",
+      "type": "timeseries",
+      "description": "Memória em uso (working set) de cada pod. Se passar o limite do manifesto, o pod é reiniciado (OOMKilled)."
+    }
+  ]
+}

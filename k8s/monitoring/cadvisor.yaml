@@ -24,6 +24,7 @@ spec:
         app: cadvisor
     spec:
       enableServiceLinks: false
+      automountServiceAccountToken: false
       containers:
         - name: cadvisor
           image: ghcr.io/google/cadvisor:v0.60.6

@@ -13,6 +13,10 @@ scrape_configs:
   - job_name: 'cadvisor'
     static_configs:
       - targets: ['cadvisor:8080']
+    metric_relabel_configs:
+      - source_labels: [container_label_io_kubernetes_pod_namespace, container_label_io_kubernetes_container_name]
+        regex: 'ticketmei;(.+)'
+        target_label: name
       
   - job_name: 'order'
     static_configs:

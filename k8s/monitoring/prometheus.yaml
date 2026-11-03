@@ -1,0 +1,85 @@
+# Prometheus: recolhe as métricas de todos os serviços a cada 5 s (como no compose).
+# A configuração é a mesma do compose (prometheus/prometheus.yml): os nomes dos Services do
+# Kubernetes são iguais aos nomes da rede do compose, por isso os alvos não mudam.
+# Essa configuração chega ao pod pelo ConfigMap prometheus-config, gerado a partir do ficheiro
+# prometheus/prometheus.yml (ver configmaps.yaml e k8s-tools/gerar-configmaps.py).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: ticketmei
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+      annotations:
+        # Resumo (hash) da configuração, escrito pelo k8s-tools/gerar-configmaps.py. Quando o
+        # prometheus.yml muda, o hash muda, o pod é recriado e o Prometheus arranca com a
+        # configuração nova (sem isto, só a leria no próximo reinício).
+        ticketmei/config-hash: "8be64e03eeb9"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.50.0
+          # Sem "args": a imagem já arranca com --config.file=/etc/prometheus/prometheus.yml e
+          # guarda os dados em /prometheus
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        # Dados das métricas: duram enquanto o pod existir (como no compose, onde também não havia
+        # volume). O histórico perde-se quando o pod é recriado, o que chega para o projeto.
+        - name: data
+          emptyDir: {}
+---
+# No Docker Desktop fica em http://localhost:9090 (Status -> Targets mostra os alvos)
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: ticketmei
+  labels:
+    app: prometheus
+spec:
+  type: LoadBalancer
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

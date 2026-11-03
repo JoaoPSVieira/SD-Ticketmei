@@ -1,0 +1,104 @@
+# Pipeline de entrega contínua (fase 3):
+#   1. descobre que serviços têm código novo (ci/cd-plano.sh)
+#   2. constrói a imagem de cada um e publica-a no GHCR, com o SHA do commit como tag
+#   3. atualiza as tags em k8s/ e faz commit no main (ci/cd-atualizar-manifestos.sh)
+# A partir daí é o Argo CD que vê o commit e faz o rolling update no cluster.
+#
+# Corre em cada push para o main que mexa no código de um serviço, e à mão
+# (separador Actions -> CD -> Run workflow), por exemplo para a primeira publicação.
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'catalog/**'
+      - 'api-gateway/**'
+      - 'order/**'
+      - 'notification/**'
+      - 'ci/cd-*.sh'
+      - '.github/workflows/cd.yml'
+  workflow_dispatch:
+
+# Uma execução de cada vez: duas a mudar os manifestos ao mesmo tempo entrariam em conflito.
+# Uma execução que fique por fazer não faz mal: a seguinte apanha tudo o que estiver em atraso.
+concurrency:
+  group: cd
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # commit das tags novas em k8s/
+  packages: write   # publicar as imagens no GHCR
+
+env:
+  # As imagens ficam em ghcr.io/joaopsvieira/ticketmei-<serviço> (o GHCR exige minúsculas)
+  REGISTRY: ghcr.io/joaopsvieira/ticketmei
+
+jobs:
+  plano:
+    name: Serviços a publicar
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      matrix: ${{ steps.plano.outputs.matrix }}
+      count: ${{ steps.plano.outputs.count }}
+
+    steps:
+      # O main mais recente, com o histórico todo (para saber o último commit de cada pasta)
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Comparar o código de cada serviço com a imagem em k8s/
+        id: plano
+        run: bash ci/cd-plano.sh
+
+  imagens:
+    name: Imagem (${{ matrix.service }})
+    needs: plano
+    if: needs.plano.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.plano.outputs.matrix) }}
+
+    steps:
+      # O código exatamente na versão da tag
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.tag }}
+
+      - name: Entrar no GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      # A label liga o pacote do GHCR ao repositório (aparece na página do repositório)
+      - name: Construir a imagem
+        env:
+          IMAGE: ${{ env.REGISTRY }}-${{ matrix.service }}:${{ matrix.tag }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          SERVICE: ${{ matrix.service }}
+        run: docker build --label "org.opencontainers.image.source=$SOURCE" -t "$IMAGE" "./$SERVICE"
+
+      - name: Publicar no GHCR
+        env:
+          IMAGE: ${{ env.REGISTRY }}-${{ matrix.service }}:${{ matrix.tag }}
+        run: docker push "$IMAGE"
+
+  manifestos:
+    name: Atualizar as tags em k8s/
+    needs: [plano, imagens]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Commit e push das tags novas
+        env:
+          PLANO: ${{ needs.plano.outputs.matrix }}
+        run: bash ci/cd-atualizar-manifestos.sh

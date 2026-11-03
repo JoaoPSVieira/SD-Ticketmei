@@ -528,3 +528,34 @@ Para mudar um dashboard ou um alvo do Prometheus, altera-se o ficheiro original,
 **cAdvisor no Kubernetes.** No Kubernetes do Docker Desktop, os pods são contentores Docker com nomes do tipo `k8s_catalog_catalog-7c8b..._ticketmei_...` e com as labels `io.kubernetes.*`. Uma regra de *relabeling* no job `cadvisor` do Prometheus põe na label `name` só o nome do contentor (`catalog`). Assim, os painéis de CPU e memória das fases 1 e 2 funcionam no compose e no Kubernetes sem alterações.
 
 **Dashboard TicketMei - Kubernetes** (novo): alvos do Prometheus em cima e em baixo, pods a correr por serviço (num *rolling update* vê-se o serviço com 2 pods durante alguns segundos), CPU e memória por pod, e pedidos de compra aceites e rejeitados pelo rate limiter (429).
+
+### Entrega contínua (GitHub Actions → GHCR → Argo CD)
+
+```
+push no main ─► CD (.github/workflows/cd.yml)
+                 1. plano: que serviços têm código novo?
+                 2. imagens: docker build + push para ghcr.io/joaopsvieira/ticketmei-<serviço>:<sha>
+                 3. manifestos: muda a tag em k8s/<serviço>.yaml e faz commit no main
+                                        │
+                                        ▼
+                Argo CD vê o commit em k8s/ ─► rolling update no cluster
+```
+
+- **Deteção de alterações por serviço:** a versão do código de um serviço é o SHA do último commit que alterou a pasta dele; se for diferente da tag no manifesto, há uma imagem nova a publicar (`ci/cd-plano.sh`). Na primeira execução as tags são `:local`, por isso são publicados os 4 serviços.
+- **Tags com o SHA do commit** (nunca `latest`): cada versão no cluster corresponde a um commit, e o rollback é um `git revert`.
+- **Atualização automática dos manifestos:** `ci/cd-atualizar-manifestos.sh` muda só a linha `image:` do serviço e faz commit com o `GITHUB_TOKEN`. Os commits feitos com o `GITHUB_TOKEN` não disparam outros workflows, por isso não há ciclos.
+- Uma execução de cada vez (`concurrency`). Se uma falhar ou ficar por fazer, a seguinte apanha o que estiver em atraso.
+
+### Rate limiter no API Gateway
+
+`POST /orders` está limitado a **5 pedidos por segundo por cliente (IP)**, com rajadas até 5, com o algoritmo *token bucket*:
+
+- os baldes estão no **Redis** (`redis:6379`), partilhados por todos os processos e réplicas do Gateway (com contadores em memória, o limite real seria 5 × 4 processos × réplicas);
+- a leitura e a escrita do balde são feitas num **script Lua**, que o Redis executa de forma atómica (sem *race conditions*), com o relógio do próprio Redis;
+- acima do limite o Gateway responde **429 Too Many Requests** sem chamar o Order, com os cabeçalhos `Retry-After`, `X-RateLimit-Limit` e `X-RateLimit-Remaining`;
+- se o Redis falhar, os pedidos passam (*fail open*) e ficam contados em `gateway_rate_limiter_errors_total`;
+- sem `REDIS_URL` (como no Docker Compose) o limite fica desligado.
+
+Configuração em `k8s/api-gateway.yaml`: `REDIS_URL`, `RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST`.
+
+Demonstração: `.\k8s-tools\k6.ps1 limite` (um cliente a tentar 20 compras por segundo durante 30 s: ~5/s aceites, o resto 429) e o dashboard **TicketMei - Kubernetes** no Grafana.

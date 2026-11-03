@@ -36,6 +36,17 @@ jobs:
           --health-interval 10s
           --health-timeout 10s
           --health-retries 10
+      
+      # Redis para os testes do rate limiter do Gateway (fase 3)
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
 
     defaults:
       run:
@@ -44,6 +55,7 @@ jobs:
     # 127.0.0.1 explícito: nas máquinas do GitHub "localhost" resolve primeiro para IPv6 (::1)
     env:
       RABBITMQ_TEST_URL: amqp://ticketmei:ticketmei@127.0.0.1:5672/
+      REDIS_TEST_URL: redis://127.0.0.1:6379/0
 
     steps:
       - uses: actions/checkout@v5
@@ -98,10 +110,6 @@ jobs:
         if: always()
         run: docker compose down -v
 
-      - name: Parar e limpar
-        if: always()
-        run: docker compose down -v
-
   # Fase 3: valida os manifestos Kubernetes contra os esquemas oficiais (incluindo a Application do
   # Argo CD). Um erro num YAML é apanhado no Pull Request, antes de chegar ao main e ao Argo CD.
   k8s:
@@ -123,4 +131,3 @@ jobs:
 
       - name: ConfigMaps da monitorização em dia
         run: python3 k8s-tools/gerar-configmaps.py --check
-    

@@ -1,0 +1,29 @@
+# Demonstração do rate limiter (fase 3): um cliente tenta 20 compras por segundo durante 30 s e o
+# Gateway aceita ~5 por segundo, respondendo 429 às restantes. Corre-se à mão com:
+#   .\k8s-tools\k6.ps1 limite
+# (fica fora da pasta k8s/ pelo mesmo motivo do k6-eventos.yaml)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-limite
+  namespace: ticketmei
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.49.0
+          args: ["run", "/scripts/rate-limit-test.js"]
+          env:
+            - name: BASE_URL
+              value: http://api-gateway:8000
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-scripts

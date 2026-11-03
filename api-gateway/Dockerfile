@@ -14,7 +14,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY main.py .
+COPY main.py rate_limiter.py ./
 
 # Corre com um utilizador sem privilégios em vez de root
 RUN useradd --create-home --uid 10001 appuser

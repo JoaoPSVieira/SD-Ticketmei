@@ -51,7 +51,7 @@ spec:
       containers:
         - name: order
           # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
-          image: ghcr.io/joaopsvieira/ticketmei-order:local
+          image: ghcr.io/joaopsvieira/ticketmei-order:252b440f2adcca260ef3698be703dd1b75e7df73
           imagePullPolicy: IfNotPresent
           env:
             - name: CATALOG_URL

@@ -48,7 +48,7 @@ spec:
       containers:
         - name: notification
           # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
-          image: ghcr.io/joaopsvieira/ticketmei-notification:local
+          image: ghcr.io/joaopsvieira/ticketmei-notification:65a54406fe9abb7712ff3994de8e3eadf59cfc81
           imagePullPolicy: IfNotPresent
           env:
             - name: RABBITMQ_USER

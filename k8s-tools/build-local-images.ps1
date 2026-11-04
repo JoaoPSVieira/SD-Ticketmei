@@ -4,7 +4,7 @@
 #
 # O Kubernetes do Docker Desktop (modo kubeadm) usa as mesmas imagens que o Docker, por isso as
 # imagens construídas aqui ficam logo disponíveis para os pods, sem registo nenhum.
-# Depois de a pipeline de CD (pessoa C) estar a funcionar, os manifestos passam a usar as imagens
+# Depois de a pipeline de CD (.github/workflows/cd.yml) correr pela primeira vez, os manifestos passam a usar as imagens
 # do GHCR com a tag do commit e este script deixa de ser necessário.
 
 $ErrorActionPreference = "Stop"

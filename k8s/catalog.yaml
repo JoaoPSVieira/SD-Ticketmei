@@ -28,7 +28,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: catalog
-          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
           image: ghcr.io/joaopsvieira/ticketmei-catalog:local
           imagePullPolicy: IfNotPresent
           env:

@@ -1,8 +1,7 @@
 # TicketMEI
 
-```markdown
 [![CI](https://github.com/JoaoPSVieira/SD-Ticketmei/actions/workflows/ci.yml/badge.svg)](https://github.com/JoaoPSVieira/SD-Ticketmei/actions/workflows/ci.yml)
-```
+[![CD](https://github.com/JoaoPSVieira/SD-Ticketmei/actions/workflows/cd.yml/badge.svg)](https://github.com/JoaoPSVieira/SD-Ticketmei/actions/workflows/cd.yml)
 
 Plataforma eletrónica de venda de bilhetes para eventos, baseada em microsserviços.
 Projeto da unidade curricular de **Sistemas Distribuídos** — Mestrado em Engenharia Informática, Universidade da Madeira, 2026/2027.
@@ -19,11 +18,9 @@ Projeto da unidade curricular de **Sistemas Distribuídos** — Mestrado em Enge
 
 | Fase | Prazo      | Conteúdo                                                         | Estado                          |
 | ---- | ---------- | ----------------------------------------------------------------- | ------------------------------- |
-| 1    | 21/10/2026 | API Gateway + Catalog, Docker Compose, Prometheus, Grafana        | Falha http_req_duration > 200ms |
+| 1    | 21/10/2026 | API Gateway + Catalog, Docker Compose, Prometheus, Grafana        | Concluída (o p95 < 200 ms foi cumprido na fase 2, com vários processos por serviço) |
 | 2    | 28/10/2026 | Order + Notification, RabbitMQ                                    | Concluída                      |
-| 3    | 04/11/2026 | Kubernetes, GitHub Actions + GHCR, ArgoCD, rate limiter com Redis | Por iniciar                     |
-
-## Arquitetura (Fase 1)
+| 3    | 04/11/2026 | Kubernetes, GitHub Actions + GHCR, ArgoCD, rate limiter com Redis | Concluída                       |
 
 ## Arquitetura (Fases 1 e 2)
 
@@ -57,8 +54,11 @@ As linhas tracejadas são o Prometheus a recolher métricas (*scrape*) de cada c
 ```
 .
 ├── .github/workflows/ci.yml      # Pipeline de CI (GitHub Actions)
-├── ci/smoke-test.sh              # Smoke test do sistema completo (usado pelo CI)
-├── api-gateway/                  # API Gateway (Python, FastAPI + aiohttp)
+├── .github/workflows/cd.yml      # Pipeline de CD: imagens no GHCR e tags em k8s/ (fase 3)
+├── ci/
+│   ├── smoke-test.sh             # Smoke test do sistema completo (usado pelo CI)
+│   └── cd-plano.sh, cd-atualizar-manifestos.sh   # Passos da CD
+├── api-gateway/                  # API Gateway (Python, FastAPI + aiohttp; rate limiter em rate_limiter.py)
 ├── catalog/                      # Catalog (Python, FastAPI)
 │   └── data/events.json          # Dados dos eventos (exclusivos do Catalog)
 ├── order/                        # Order (Python, FastAPI + SQLite + aio-pika)
@@ -67,10 +67,15 @@ As linhas tracejadas são o Prometheus a recolher métricas (*scrape*) de cada c
 │   └── prometheus.yml            # Configuração de scraping
 ├── grafana/
 │   ├── provisioning/             # Datasource e provider de dashboards
-│   └── dashboards/               # dashboard1.json, catalog.json, order-notification.json, rabbitmq-overview.json
+│   └── dashboards/               # dashboard1.json, catalog.json, order-notification.json, rabbitmq-overview.json, kubernetes.json
 ├── k6/
 │   ├── load-test.js              # Teste de carga dos eventos (fornecido pela docente)
-│   └── orders-test.js            # Teste de carga das compras
+│   ├── orders-test.js            # Teste de carga das compras
+│   └── rate-limit-test.js        # Demonstração do rate limiter (429)
+├── k8s/                          # Manifestos Kubernetes, sincronizados pelo Argo CD (fase 3)
+│   └── monitoring/               # Prometheus, Grafana e cAdvisor no cluster
+├── argocd/application.yaml       # Application do Argo CD (aplicada uma vez)
+├── k8s-tools/                    # Imagens locais, gerador de ConfigMaps e Jobs do k6 no cluster
 ├── docs/img/                     # Capturas de ecrã usadas neste README
 ├── docker-compose.yml
 └── README.md
@@ -327,6 +332,8 @@ Thresholds: p95 da latência < 200 ms e menos de 1% de pedidos falhados.
 
 ### Resultados
 
+Primeira execução (fase 1), ainda com um só processo no Gateway e no Catalog: o p95 ficou acima do threshold. A correção (vários processos por contentor) está nas *Decisões técnicas*.
+
 | Métrica         | Resultado                       |
 | ---------------- | ------------------------------- |
 | Pedidos totais   | 512747                          |
@@ -396,7 +403,7 @@ Fase 2:
 - **`aiohttp` como cliente HTTP no Gateway.** Num teste com o script k6 e 500 utilizadores virtuais, o `httpx` ficou em 261 pedidos/s com p95 de 4,6 s; o `aiohttp` chegou aos 2 118 pedidos/s com p95 de 174 ms, na mesma máquina.
 - **Uma única sessão HTTP com pool de ligações (keep-alive)** entre o Gateway e o Catalog, criada no arranque do Gateway, em vez de uma ligação nova por pedido.
 - **Timeout de 2 s** nas chamadas ao Catalog. Um Catalog bloqueado nunca prende o Gateway indefinidamente.
-- **Um só processo por contentor.** As métricas do `prometheus_client` vivem na memória do processo. Com vários processos, cada um teria contadores diferentes. Para escalar usam-se réplicas (Fase 3).
+- **Vários processos por contentor** (`WEB_CONCURRENCY`: 4 no Gateway, 2 no Catalog e no Order). Um processo Python só usa um core de cada vez, e com um só processo o Gateway não cumpria o p95 < 200 ms. Como as métricas do `prometheus_client` vivem na memória de cada processo, cada um escreve-as em ficheiros (`PROMETHEUS_MULTIPROC_DIR`) e o `/metrics` soma-as todas.
 - **O Catalog lê e valida o `events.json` uma vez no arranque** e guarda as respostas já serializadas em JSON. Os dados são estáticos e cada pedido só devolve bytes prontos.
 - **Healthchecks e `depends_on: condition: service_healthy`** para uma ordem de arranque correta.
 - **Contentores com utilizador sem privilégios** e imagens `python:3.13-slim`.
@@ -411,13 +418,16 @@ Fase 2:
 
 O pipeline `.github/workflows/ci.yml` corre em cada push para o `main`, em cada Pull Request e à mão (separador **Actions** → **CI** → **Run workflow**):
 
-1. **Testes**: um job por serviço (Catalog, API Gateway, Order, Notification), com um RabbitMQ verdadeiro para os testes de integração.
+1. **Testes**: um job por serviço (Catalog, API Gateway, Order, Notification), com um RabbitMQ e um Redis verdadeiros para os testes de integração.
 2. **Docker Compose e k6**, só se os testes passarem:
    - valida o `docker-compose.yml` e constrói as imagens;
    - arranca os serviços e espera que fiquem `healthy`;
    - corre o smoke test (`ci/smoke-test.sh`): eventos, compras, notificação e targets do Prometheus;
    - corre os dois testes k6 com carga reduzida (as máquinas do GitHub Actions são pequenas e partilhadas). Os thresholds dos scripts continuam a aplicar-se.
    - se algum passo falhar, mostra os logs dos serviços.
+3. **Manifestos Kubernetes** (fase 3): valida `k8s/`, `k8s-tools/` e `argocd/` com o `kubeconform` (esquemas oficiais do Kubernetes e da `Application` do Argo CD) e confirma que os ConfigMaps da monitorização estão em dia.
+
+A entrega contínua (imagens no GHCR e tags em `k8s/`) está no `cd.yml`, descrita na secção da fase 3.
 
 ![Pipeline de CI](docs/img/github-actions.png)
 

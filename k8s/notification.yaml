@@ -47,7 +47,7 @@ spec:
               mountPath: /app/logs
       containers:
         - name: notification
-          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
           image: ghcr.io/joaopsvieira/ticketmei-notification:local
           imagePullPolicy: IfNotPresent
           env:

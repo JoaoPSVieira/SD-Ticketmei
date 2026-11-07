@@ -50,7 +50,7 @@ spec:
               mountPath: /app/data
       containers:
         - name: order
-          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
           image: ghcr.io/joaopsvieira/ticketmei-order:local
           imagePullPolicy: IfNotPresent
           env:

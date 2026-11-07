@@ -26,7 +26,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: api-gateway
-          # A pipeline de CD (pessoa C) substitui ":local" pela tag do commit (SHA) a cada alteração
+          # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
           image: ghcr.io/joaopsvieira/ticketmei-api-gateway:local
           imagePullPolicy: IfNotPresent
           env:
@@ -39,9 +39,13 @@ spec:
               value: http://order:8002
             - name: ORDER_TIMEOUT_SECONDS
               value: "5"
-            # Redis do rate limiter (usado pelo código da pessoa C)
+            # Rate limiter do POST /orders: baldes no Redis, 5 compras/s por cliente (IP), rajadas até 5
             - name: REDIS_URL
               value: redis://redis:6379/0
+            - name: RATE_LIMIT_PER_SECOND
+              value: "5"
+            - name: RATE_LIMIT_BURST
+              value: "5"
             - name: WEB_CONCURRENCY
               value: "4"
           ports:

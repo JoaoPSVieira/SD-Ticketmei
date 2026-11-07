@@ -20,7 +20,7 @@ spec:
     targetRevision: main
     path: k8s
     directory:
-      recurse: true # inclui as subpastas (por exemplo k8s/monitoring/, da pessoa B)
+      recurse: true # inclui as subpastas (por exemplo k8s/monitoring/, com o Prometheus e o Grafana)
 
   # Para onde vai: o próprio cluster onde o Argo CD está instalado, namespace ticketmei
   destination:

@@ -173,7 +173,10 @@ def run_checks(client_ids: list[str], *, capacity: int, rate: float, concurrent:
     """Faz uma verificação por elemento de client_ids, com um limitador novo ligado ao Redis de teste."""
 
     async def _run():
-        limiter = RateLimiter(REDIS_TEST_URL, rate=rate, capacity=capacity,
+        # Timeout folgado: estes testes verificam o algoritmo, não a rapidez da ligação. No Windows, o
+        # Redis do Docker Desktop pode demorar mais de 0,2 s (o timeout normal) a aceitar dezenas de
+        # ligações ao mesmo tempo, e a verificação passaria a "Redis indisponível".
+        limiter = RateLimiter(REDIS_TEST_URL, rate=rate, capacity=capacity, timeout_seconds=5,
                               key_prefix=key_prefix or f"teste-{uuid.uuid4().hex}")
         try:
             if concurrent:
@@ -182,7 +185,9 @@ def run_checks(client_ids: list[str], *, capacity: int, rate: float, concurrent:
         finally:
             await limiter.close()
 
-    return asyncio.run(_run())
+    decisions = asyncio.run(_run())
+    assert None not in decisions, "O Redis de teste não respondeu a tempo (ver REDIS_TEST_URL)"
+    return decisions
 
 
 @needs_redis

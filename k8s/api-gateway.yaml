@@ -26,7 +26,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: api-gateway
-          # A pipeline de CD (.github/workflows/cd.yml) substitui ":local" pela tag do commit (SHA) a cada alteração
+          # A pipeline de CD (.github/workflows/cd.yml)
           image: ghcr.io/joaopsvieira/ticketmei-api-gateway:ae6f7181159d74f6b7399210997c25a5a110dfcb
           imagePullPolicy: IfNotPresent
           env:

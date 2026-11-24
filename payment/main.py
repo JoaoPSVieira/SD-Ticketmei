@@ -126,6 +126,13 @@ CREATE TABLE IF NOT EXISTS payments (
 )
 """
 
+# Idempotência garantida pela própria base de dados: no máximo um pagamento SUCCESS por compra.
+# As tentativas FAILED podem repetir-se (cada retry do Order é uma tentativa nova).
+ONE_SUCCESS_PER_ORDER = """
+CREATE UNIQUE INDEX IF NOT EXISTS payments_one_success_per_order
+    ON payments (order_id) WHERE status = 'SUCCESS'
+"""
+
 
 def open_database(path: Path) -> sqlite3.Connection:
     """Abre (e cria, se ainda não existir) a base de dados."""
@@ -134,6 +141,7 @@ def open_database(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(SCHEMA)
+    conn.execute(ONE_SUCCESS_PER_ORDER)
     return conn
 
 
@@ -148,6 +156,11 @@ def insert_payment(conn: sqlite3.Connection, order_id: str, amount: float, statu
 
 def find_payment(conn: sqlite3.Connection, payment_id: int) -> Payment | None:
     row = conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+    return Payment(**dict(row)) if row else None
+
+
+def find_successful_payment(conn: sqlite3.Connection, order_id: str) -> Payment | None:
+    row = conn.execute("SELECT * FROM payments WHERE order_id = ? AND status = 'SUCCESS'", (order_id,)).fetchone()
     return Payment(**dict(row)) if row else None
 
 
@@ -208,18 +221,34 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     },
 )
 async def create_payment(request: PaymentRequest) -> Response:
-    """Processa (simula) o pagamento de uma compra, com as falhas configuradas."""
+    """
+    Processa (simula) o pagamento de uma compra, com as falhas configuradas.
+
+    Idempotente pelo order_id: se a compra já foi paga, devolve esse pagamento (200) sem cobrar
+    outra vez. É o que impede que um retry do Order, depois de um timeout, cobre duas vezes.
+    """
     faults = app.state.faults
 
     # 1.º a latência, depois o sorteio da falha: um pagamento lento pode também falhar
     if faults.latency_seconds > 0:
         await asyncio.sleep(faults.latency_seconds)
 
+    # Verifica-se depois da espera: um retry pode ter chegado enquanto este pedido esperava.
+    # Daqui até ao INSERT não há nenhum await, por isso nenhum outro pedido corre no meio.
+    paid = find_successful_payment(app.state.db, request.order_id)
+    if paid is not None:
+        return JSONResponse(status_code=200, content=paid.model_dump())
+
     if random.random() < faults.error_rate:
         insert_payment(app.state.db, request.order_id, request.amount, "FAILED")
         return JSONResponse(status_code=500, content={"error": "Payment failed", "status": "FAILED"})
 
-    payment = insert_payment(app.state.db, request.order_id, request.amount, "SUCCESS")
+    try:
+        payment = insert_payment(app.state.db, request.order_id, request.amount, "SUCCESS")
+    except sqlite3.IntegrityError:
+        # Só acontece se outro processo pagou a mesma compra entretanto (o índice único recusou)
+        paid = find_successful_payment(app.state.db, request.order_id)
+        return JSONResponse(status_code=200, content=paid.model_dump())
     return JSONResponse(status_code=201, content=payment.model_dump(),
                         headers={"Location": f"/payments/{payment.id}"})
 

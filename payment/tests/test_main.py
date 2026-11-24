@@ -1,6 +1,8 @@
 """Testes do serviço Payment. Correr com: python -m pytest (dentro da pasta payment/)."""
 
+import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
@@ -124,6 +126,65 @@ def test_stats_count_successful_and_failed_payments(client):
     client.post("/payments", json=payment_request())
 
     assert client.get("/payments/stats").json() == {"SUCCESS": 1, "FAILED": 2}
+
+
+# --- Idempotência pelo order_id -------------------------------------------------
+
+def test_paying_the_same_order_twice_returns_the_first_payment_with_200(client):
+    request = payment_request()
+    first = client.post("/payments", json=request)
+
+    second = client.post("/payments", json=request)
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert client.get("/payments/stats").json() == {"SUCCESS": 1, "FAILED": 0}
+
+
+def test_an_order_already_paid_is_not_affected_by_new_faults(client):
+    # Um retry do Order depois de um timeout não pode transformar um pagamento feito numa falha
+    request = payment_request()
+    first = client.post("/payments", json=request).json()
+    configure(client, error_rate=1)
+
+    retry = client.post("/payments", json=request)
+
+    assert retry.status_code == 200
+    assert retry.json() == first
+
+
+def test_a_failed_payment_can_be_tried_again(client):
+    request = payment_request()
+    configure(client, error_rate=1)
+    assert client.post("/payments", json=request).status_code == 500
+
+    configure(client, error_rate=0)
+    assert client.post("/payments", json=request).status_code == 201
+    assert client.get("/payments/stats").json() == {"SUCCESS": 1, "FAILED": 1}
+
+
+def test_concurrent_payments_of_the_same_order_charge_only_once(client):
+    # Vários pedidos da mesma compra ao mesmo tempo (ex.: o retry chega enquanto o 1.º ainda espera)
+    configure(client, latency_seconds=0.2)
+    request = payment_request()
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        responses = list(pool.map(lambda _: client.post("/payments", json=request), range(5)))
+
+    assert sorted(r.status_code for r in responses) == [200, 200, 200, 200, 201]
+    assert len({r.json()["id"] for r in responses}) == 1
+    assert client.get("/payments/stats").json() == {"SUCCESS": 1, "FAILED": 0}
+
+
+def test_the_database_refuses_two_successful_payments_for_the_same_order(tmp_path):
+    conn = main.open_database(tmp_path / "payments.db")
+    main.insert_payment(conn, "order-1", 10.0, "SUCCESS")
+    main.insert_payment(conn, "order-1", 10.0, "FAILED")  # tentativas falhadas podem repetir-se
+
+    with pytest.raises(sqlite3.IntegrityError):
+        main.insert_payment(conn, "order-1", 10.0, "SUCCESS")
+    conn.close()
 
 
 # --- Falhas injetadas: latência -------------------------------------------------

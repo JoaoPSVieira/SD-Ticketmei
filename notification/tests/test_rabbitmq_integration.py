@@ -15,6 +15,7 @@ import aio_pika
 import pytest
 from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
+from yarl import URL
 
 import main
 from conftest import encode, order_created, read_log
@@ -146,6 +147,23 @@ def test_prefetch_processes_messages_in_parallel(start_consumer, queue_name, mon
 
     # Uma a uma seriam 50 x 100 ms = 5 s; com 10 em paralelo, ~0,5 s (mais o tempo de ligar)
     assert elapsed < 3
+
+
+def test_connects_with_the_rabbitmq_host_variables(start_consumer, monkeypatch):
+    # Como no cluster global: endereço montado a partir das partes, com o vhost "/" codificado (%2F)
+    test_url = URL(RABBITMQ_TEST_URL)
+    url = main.rabbitmq_url_from_env({
+        "RABBITMQ_HOST": test_url.host,
+        "RABBITMQ_PORT": str(test_url.port),
+        "RABBITMQ_VHOST": "/",
+        "RABBITMQ_USER": test_url.user,
+        "RABBITMQ_PASSWORD": test_url.password,
+    })
+    monkeypatch.setattr(main, "RABBITMQ_URL", url)
+
+    client = start_consumer()  # falha o teste se não ligar
+
+    assert client.get("/health").json()["rabbitmq"] == "connected"
 
 
 def test_message_is_redelivered_after_an_unexpected_error(start_consumer, queue_name, monkeypatch):

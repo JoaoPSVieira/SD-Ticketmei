@@ -28,9 +28,11 @@ import os
 import random
 import re
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import aio_pika
 from fastapi import FastAPI
@@ -50,7 +52,31 @@ logger = logging.getLogger("notification")
 # Mostra só os erros da biblioteca do RabbitMQ (sem tracebacks longos quando a ligação cai e volta)
 logging.getLogger("aiormq").setLevel(logging.ERROR)
 
-RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://ticketmei:ticketmei@localhost:5672/")
+def rabbitmq_url_from_env(env: Mapping[str, str]) -> str:
+    """
+    Endereço do RabbitMQ (regra combinada com o Order, secção 8 do plano da Parte II):
+
+    - cluster local: RABBITMQ_URL (o RabbitMQ do próprio projeto);
+    - cluster global: RABBITMQ_HOST, RABBITMQ_VHOST, RABBITMQ_USER e RABBITMQ_PASSWORD (o RabbitMQ
+      partilhado da UMa, com um vhost por grupo). Se RABBITMQ_HOST estiver definido, ganha.
+
+    O vhost vai codificado no caminho do URL ("/grupoXX" -> "%2FgrupoXX"), e o utilizador e a
+    password também, para uma password com "@", ":" ou "/" não estragar o URL.
+    """
+    host = env.get("RABBITMQ_HOST", "").strip()
+    if not host:
+        return env.get("RABBITMQ_URL", "amqp://ticketmei:ticketmei@localhost:5672/")
+
+    user, password = env.get("RABBITMQ_USER"), env.get("RABBITMQ_PASSWORD")
+    if not user or not password:
+        raise ValueError("RABBITMQ_HOST está definido, mas faltam RABBITMQ_USER e/ou RABBITMQ_PASSWORD")
+    port = env.get("RABBITMQ_PORT", "5672")
+    vhost = env.get("RABBITMQ_VHOST", "/")
+    return f"amqp://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{quote(vhost, safe='')}"
+
+
+# Um valor inválido (ex.: RABBITMQ_HOST sem credenciais) impede o serviço de arrancar, com o erro no log
+RABBITMQ_URL = rabbitmq_url_from_env(os.environ)
 ORDER_QUEUE = os.getenv("ORDER_QUEUE", "order_created")
 RABBITMQ_RETRY_SECONDS = float(os.getenv("RABBITMQ_RETRY_SECONDS", "2"))
 

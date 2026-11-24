@@ -1,0 +1,138 @@
+# Order: cria compras (POST /orders), guarda-as em SQLite e publica OrderCreated no RabbitMQ.
+# Versão do cluster global (k3s da UMa): Pod Security "restricted", disco nfs-csi, RabbitMQ partilhado.
+
+# Disco persistente para a base de dados SQLite
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: order-data
+  namespace: grupo08
+  annotations:
+    # O Argo CD nunca apaga este disco (e os dados) num prune
+    argocd.argoproj.io/sync-options: Prune=false
+spec:
+  storageClassName: nfs-csi
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order
+  namespace: grupo08
+  labels:
+    app: order
+spec:
+  replicas: 1
+  # Recreate: o pod antigo para antes de arrancar o novo. Com SQLite num disco NFS (modo DELETE),
+  # dois pods a escrever no mesmo ficheiro ao mesmo tempo podem corromper ou bloquear a base de dados.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: order
+  template:
+    metadata:
+      labels:
+        app: order
+    spec:
+      enableServiceLinks: false
+      # Pod Security "restricted": sem root, sem initContainer a fazer chown.
+      # O fsGroup dá ao grupo 10001 acesso ao disco montado.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: order
+          # A pipeline de CD (.github/workflows/cd.yml) atualiza esta linha
+          image: ghcr.io/joaopsvieira/ticketmei-order:252b440f2adcca260ef3698be703dd1b75e7df73
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: CATALOG_URL
+              value: http://catalog:8001
+            # RabbitMQ partilhado da UMa. O código monta o URL a partir destas 4 variáveis.
+            - name: RABBITMQ_HOST
+              value: rabbitmq.rabbitmq-system.svc.cluster.local
+            - name: RABBITMQ_VHOST
+              value: /grupo08
+            # Secret criado pela docente no namespace grupo08
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grupo08-user-user-credentials
+                  key: username
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grupo08-user-user-credentials
+                  key: password
+            - name: ORDERS_DB_PATH
+              value: /app/data/orders.db
+            # NFS não gosta do modo WAL
+            - name: SQLITE_JOURNAL_MODE
+              value: DELETE
+            # Um só processo: um circuit breaker e um escritor SQLite
+            - name: WEB_CONCURRENCY
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8002
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          # O /health responde 200 mesmo sem RabbitMQ (mostra "rabbitmq": "disconnected")
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: order-data
+---
+# Nome "order" no DNS do cluster (http://order:8002). O Gateway encaminha para aqui.
+apiVersion: v1
+kind: Service
+metadata:
+  name: order
+  namespace: grupo08
+  labels:
+    app: order
+spec:
+  selector:
+    app: order
+  ports:
+    - name: http
+      port: 8002
+      targetPort: http

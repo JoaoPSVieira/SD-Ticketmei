@@ -1,0 +1,132 @@
+# Notification: consome as mensagens OrderCreated da fila e "envia" o email de confirmação.
+# Versão do cluster global (k3s da UMa): Pod Security "restricted", disco nfs-csi, RabbitMQ partilhado.
+
+# Disco persistente para o log de entregas
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notification-logs
+  namespace: grupo08
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+spec:
+  storageClassName: nfs-csi
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  namespace: grupo08
+  labels:
+    app: notification
+spec:
+  replicas: 1
+  # Durante a troca há dois consumidores durante alguns segundos: repartem as mensagens da fila
+  # entre si (competing consumers), por isso nenhuma se perde nem é tratada duas vezes
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: notification
+  template:
+    metadata:
+      labels:
+        app: notification
+    spec:
+      enableServiceLinks: false
+      # Pod Security "restricted": sem root e sem initContainer a fazer chown.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: notification
+          # A pipeline de CD (.github/workflows/cd.yml) atualiza esta linha
+          image: ghcr.io/joaopsvieira/ticketmei-notification:be0a2304994d6140a33bc6bd0d7ff4f4b279b4c5
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # RabbitMQ partilhado da UMa. O código monta o URL a partir destas 4 variáveis.
+            - name: RABBITMQ_HOST
+              value: rabbitmq.rabbitmq-system.svc.cluster.local
+            - name: RABBITMQ_VHOST
+              value: /grupo08
+            # Secret criado pela docente no namespace grupo08
+            - name: RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grupo08-user-user-credentials
+                  key: username
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grupo08-user-user-credentials
+                  key: password
+            - name: NOTIFICATIONS_LOG_PATH
+              value: /app/logs/notifications.log
+            # Mensagens tratadas em paralelo (com 100 ms por email, 10 dá ~100 notificações/s)
+            - name: PREFETCH_COUNT
+              value: "10"
+            # Percentagem de envios que falham de propósito (0 a 1); 0.1 = 10%
+            - name: NOTIFICATION_FAILURE_RATE
+              value: "0"
+          ports:
+            - name: http
+              containerPort: 8003
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: notification-logs
+---
+# Não recebe pedidos dos clientes; o Service existe para o Prometheus ler o /metrics (notification:8003)
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification
+  namespace: grupo08
+  labels:
+    app: notification
+spec:
+  selector:
+    app: notification
+  ports:
+    - name: http
+      port: 8003
+      targetPort: http

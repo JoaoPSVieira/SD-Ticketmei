@@ -1,0 +1,125 @@
+# Payment: simula o sistema de pagamentos (POST /payments), com falhas e latência configuráveis
+# (POST /payments/configure-faults) para testar o circuit breaker do Order.
+
+# Disco persistente para a base de dados SQLite (equivale ao volume payment-data do compose)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: payment-data
+  namespace: grupo08
+  annotations:
+    # O Argo CD nunca apaga este disco (e os dados) num prune
+    argocd.argoproj.io/sync-options: Prune=false
+spec:
+  storageClassName: nfs-csi
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment
+  namespace: grupo08
+  labels:
+    app: payment
+spec:
+  # Uma réplica com um só processo: a configuração das falhas vive na memória do processo
+  replicas: 1
+  # Recreate: o pod antigo para antes de o novo arrancar, para nunca haver dois processos com
+  # configurações de falhas diferentes nem dois a escrever no mesmo ficheiro SQLite (no cluster
+  # global o disco é NFS). Durante esses segundos o circuit breaker do Order protege as compras.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: payment
+  template:
+    metadata:
+      labels:
+        app: payment
+    spec:
+      enableServiceLinks: false
+      # Regras "restricted" do cluster global (Pod Security): sem root, sem privilégios.
+      # runAsUser é obrigatório porque o Dockerfile define o utilizador pelo nome (appuser, uid 10001).
+      # fsGroup: o disco passa a pertencer ao grupo 10001, para o appuser poder criar o payments.db.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: payment
+          # A pipeline de CD (.github/workflows/cd.yml) muda esta tag para o SHA do commit.
+          # Até lá usa-se a imagem local (k8s-tools/build-local-images.ps1).
+          image: ghcr.io/joaopsvieira/ticketmei-payment:local
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PAYMENTS_DB_PATH
+              value: /app/data/payments.db
+            - name: WEB_CONCURRENCY
+              value: "1"
+            # No global (disco NFS) usa-se DELETE; o WAL fica só no cluster local
+            - name: SQLITE_JOURNAL_MODE
+              value: DELETE
+            # Falhas no arranque; mudam-se em tempo real com POST /payments/configure-faults
+            - name: PAYMENT_ERROR_RATE
+              value: "0"
+            - name: PAYMENT_LATENCY_SECONDS
+              value: "0"
+          ports:
+            - name: http
+              containerPort: 8004
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          # O /health responde mesmo com falhas injetadas (a latência só se aplica a POST /payments),
+          # por isso o teste dos 10 s de atraso não faz o Kubernetes reiniciar o pod
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: payment-data
+---
+# Nome "payment" no DNS do cluster (http://payment:8004). O Order chama-o aqui; não é exposto pelo Gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment
+  namespace: grupo08
+  labels:
+    app: payment
+spec:
+  selector:
+    app: payment
+  ports:
+    - name: http
+      port: 8004
+      targetPort: http

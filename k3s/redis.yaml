@@ -57,6 +57,7 @@ spec:
               cpu: 25m
               memory: 32Mi
             limits:
+              cpu: 100m
               memory: 128Mi
 ---
 # O Gateway liga-se a redis:6379 (REDIS_URL=redis://redis:6379/0). Só é acessível dentro do cluster.

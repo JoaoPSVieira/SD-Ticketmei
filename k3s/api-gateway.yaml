@@ -90,6 +90,7 @@ spec:
               cpu: 100m
               memory: 256Mi
             limits:
+              cpu: 300m
               memory: 512Mi
 ---
 # ClusterIP no cluster global (não há LoadBalancer para o nosso namespace): o endereço dentro do

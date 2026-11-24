@@ -191,6 +191,8 @@ Não tem endpoints de negócio: consome as mensagens `OrderCreated` da fila `ord
 | ----------------------------- | ------------ | --------------------------------------------------------------------------- |
 | `PREFETCH_COUNT`            | `10`       | Mensagens processadas em paralelo (~100 notificações/s)                   |
 | `NOTIFICATION_FAILURE_RATE` | `0`        | Percentagem de envios que falham de propósito (0 a 1), para demonstração |
+| `RABBITMQ_URL`              | `amqp://ticketmei:ticketmei@localhost:5672/` | Endereço do RabbitMQ no cluster local e no compose |
+| `RABBITMQ_HOST`, `RABBITMQ_VHOST`, `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | — | Cluster global (RabbitMQ partilhado, um vhost por grupo). Se `RABBITMQ_HOST` estiver definido, o endereço é `amqp://USER:PASSWORD@HOST:5672/<vhost codificado>` (`/grupoXX` → `%2FgrupoXX`) e o `RABBITMQ_URL` é ignorado. O utilizador e a password vêm do Secret do cluster. |
 
 ### Payment (porta 8004)
 
@@ -265,6 +267,7 @@ O Order e o Notification comunicam só através da fila `order_created` do Rabbi
 |              |                                                                                                                                        |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | Fila         | `order_created`, durável. Os dois serviços declaram-na; declarar uma fila que já existe não faz nada.                            |
+| Exchange (Parte II) | `orders.exchange`, *direct* e durável, ligada à fila `order_created` pela routing key `order.created`. O Notification declara-a e faz a ligação; o Order da Parte II publica aí depois de a compra ficar `CONFIRMED`. A fila continua a receber o que chega pela exchange por omissão, por isso o Order da Parte I também funciona. |
 | Publicação | Exchange por omissão, `routing_key="order_created"`, mensagens persistentes, `type="OrderCreated"`, `message_id` = id da compra |
 | Corpo        | JSON: `type`, `order_id`, `customer_id`, `customer_email`, `event_id`, `quantity`, `total_amount`, `created_at`        |
 

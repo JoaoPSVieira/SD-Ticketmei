@@ -1,7 +1,7 @@
 # Order: cria compras (POST /orders), guarda-as em SQLite e publica OrderCreated no RabbitMQ.
 # Versão do cluster global (k3s da UMa): Pod Security "restricted", disco nfs-csi, RabbitMQ partilhado.
 
-# Disco persistente para a base de dados SQLite
+# Disco persistente para a base de dados SQLite (128Mi: a quota do grupo08 limita o total a 1536Mi)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -15,7 +15,7 @@ spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      storage: 1Gi
+      storage: 128Mi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -112,7 +112,7 @@ spec:
                 command: ["sleep", "5"]
           resources:
             requests:
-              cpu: 100m
+              cpu: 75m
               memory: 128Mi
             limits:
               memory: 384Mi

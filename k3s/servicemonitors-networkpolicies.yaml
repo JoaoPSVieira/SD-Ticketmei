@@ -1,0 +1,214 @@
+# ServiceMonitor (Prometheus partilhado da UMa recolhe o /metrics) e NetworkPolicy por serviço.
+# Baseado no template da docente. Os Services já existem em cada ficheiro do serviço
+# (porta com o nome "http", label app: <serviço>), por isso aqui não se repetem.
+# O Redis não expõe /metrics, por isso não tem ServiceMonitor nem NetworkPolicy.
+
+---
+# api-gateway
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-gateway
+  namespace: grupo08
+  labels:
+    release: kube-prometheus-stack-prometheus   # tem de bater com o serviceMonitorSelector do Prometheus
+spec:
+  selector:
+    matchLabels:
+      app: api-gateway                                  # escolhe o Service com esta label
+  endpoints:
+    - port: http                                # nome da porta no Service
+      path: /metrics
+      interval: 60s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-api-gateway
+  namespace: grupo08
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. O Prometheus (namespace monitoring) lê o /metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+    # 2. Os outros pods do nosso namespace (ex.: Gateway -> Catalog/Order, Order -> Payment)
+    - from:
+        - podSelector: {}
+
+---
+# catalog
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: catalog
+  namespace: grupo08
+  labels:
+    release: kube-prometheus-stack-prometheus   # tem de bater com o serviceMonitorSelector do Prometheus
+spec:
+  selector:
+    matchLabels:
+      app: catalog                                  # escolhe o Service com esta label
+  endpoints:
+    - port: http                                # nome da porta no Service
+      path: /metrics
+      interval: 60s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-catalog
+  namespace: grupo08
+spec:
+  podSelector:
+    matchLabels:
+      app: catalog
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. O Prometheus (namespace monitoring) lê o /metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8001
+    # 2. Os outros pods do nosso namespace (ex.: Gateway -> Catalog/Order, Order -> Payment)
+    - from:
+        - podSelector: {}
+
+---
+# order
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order
+  namespace: grupo08
+  labels:
+    release: kube-prometheus-stack-prometheus   # tem de bater com o serviceMonitorSelector do Prometheus
+spec:
+  selector:
+    matchLabels:
+      app: order                                  # escolhe o Service com esta label
+  endpoints:
+    - port: http                                # nome da porta no Service
+      path: /metrics
+      interval: 60s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-order
+  namespace: grupo08
+spec:
+  podSelector:
+    matchLabels:
+      app: order
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. O Prometheus (namespace monitoring) lê o /metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8002
+    # 2. Os outros pods do nosso namespace (ex.: Gateway -> Catalog/Order, Order -> Payment)
+    - from:
+        - podSelector: {}
+
+---
+# notification
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: notification
+  namespace: grupo08
+  labels:
+    release: kube-prometheus-stack-prometheus   # tem de bater com o serviceMonitorSelector do Prometheus
+spec:
+  selector:
+    matchLabels:
+      app: notification                                  # escolhe o Service com esta label
+  endpoints:
+    - port: http                                # nome da porta no Service
+      path: /metrics
+      interval: 60s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-notification
+  namespace: grupo08
+spec:
+  podSelector:
+    matchLabels:
+      app: notification
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. O Prometheus (namespace monitoring) lê o /metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8003
+    # 2. Os outros pods do nosso namespace (ex.: Gateway -> Catalog/Order, Order -> Payment)
+    - from:
+        - podSelector: {}
+
+---
+# payment
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: payment
+  namespace: grupo08
+  labels:
+    release: kube-prometheus-stack-prometheus   # tem de bater com o serviceMonitorSelector do Prometheus
+spec:
+  selector:
+    matchLabels:
+      app: payment                                  # escolhe o Service com esta label
+  endpoints:
+    - port: http                                # nome da porta no Service
+      path: /metrics
+      interval: 60s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-payment
+  namespace: grupo08
+spec:
+  podSelector:
+    matchLabels:
+      app: payment
+  policyTypes:
+    - Ingress
+  ingress:
+    # 1. O Prometheus (namespace monitoring) lê o /metrics
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8004
+    # 2. Os outros pods do nosso namespace (ex.: Gateway -> Catalog/Order, Order -> Payment)
+    - from:
+        - podSelector: {}

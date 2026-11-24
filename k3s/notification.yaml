@@ -1,12 +1,16 @@
 # Notification: consome as mensagens OrderCreated da fila e "envia" o email de confirmação.
+# Versão do cluster global (k3s da UMa): Pod Security "restricted", disco nfs-csi, RabbitMQ partilhado.
 
-# Disco persistente para o log de entregas (equivale ao volume notification-logs do compose)
+# Disco persistente para o log de entregas
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: notification-logs
   namespace: grupo08
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
 spec:
+  storageClassName: nfs-csi
   accessModes: [ReadWriteOnce]
   resources:
     requests:
@@ -37,32 +41,40 @@ spec:
         app: notification
     spec:
       enableServiceLinks: false
-      # Como no Order: dá a pasta do disco ao appuser (uid 10001) antes de o serviço arrancar
-      initContainers:
-        - name: permissoes-logs
-          image: busybox:1.36
-          command: ["sh", "-c", "chown -R 10001:10001 /app/logs"]
-          volumeMounts:
-            - name: logs
-              mountPath: /app/logs
+      # Pod Security "restricted": sem root e sem initContainer a fazer chown.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: notification
-          # A pipeline de CD (.github/workflows/cd.yml)
+          # A pipeline de CD (.github/workflows/cd.yml) atualiza esta linha
           image: ghcr.io/joaopsvieira/ticketmei-notification:be0a2304994d6140a33bc6bd0d7ff4f4b279b4c5
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
+            # RabbitMQ partilhado da UMa. O código monta o URL a partir destas 4 variáveis.
+            - name: RABBITMQ_HOST
+              value: rabbitmq.rabbitmq-system.svc.cluster.local
+            - name: RABBITMQ_VHOST
+              value: /grupo08
+            # Secret criado pela docente no namespace grupo08
             - name: RABBITMQ_USER
               valueFrom:
                 secretKeyRef:
-                  name: rabbitmq-credentials
+                  name: grupo08-user-user-credentials
                   key: username
-            - name: RABBITMQ_PASS
+            - name: RABBITMQ_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: rabbitmq-credentials
+                  name: grupo08-user-user-credentials
                   key: password
-            - name: RABBITMQ_URL
-              value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASS)@rabbitmq:5672/
             - name: NOTIFICATIONS_LOG_PATH
               value: /app/logs/notifications.log
             # Mensagens tratadas em paralelo (com 100 ms por email, 10 dá ~100 notificações/s)

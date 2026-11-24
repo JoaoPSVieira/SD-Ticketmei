@@ -1,4 +1,4 @@
-﻿# Constrói as imagens dos 4 serviços com os nomes usados nos manifestos da pasta k8s/.
+﻿# Constrói as imagens dos serviços com os nomes usados nos manifestos da pasta k8s/.
 #
 # Uso (na raiz do repositório):   .\k8s-tools\build-local-images.ps1
 #
@@ -8,7 +8,7 @@
 # do GHCR com a tag do commit e este script deixa de ser necessário.
 
 $ErrorActionPreference = "Stop"
-$services = @("catalog", "api-gateway", "order", "notification")
+$services = @("catalog", "api-gateway", "order", "notification", "payment")
 
 foreach ($service in $services) {
     $image = "ghcr.io/joaopsvieira/ticketmei-${service}:local"

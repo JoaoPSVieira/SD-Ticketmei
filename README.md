@@ -63,6 +63,7 @@ As linhas tracejadas são o Prometheus a recolher métricas (*scrape*) de cada c
 │   └── data/events.json          # Dados dos eventos (exclusivos do Catalog)
 ├── order/                        # Order (Python, FastAPI + SQLite + aio-pika)
 ├── notification/                 # Notification (Python, aio-pika)
+├── payment/                      # Payment (Python, FastAPI + SQLite), com falhas configuráveis (Parte II)
 ├── prometheus/
 │   └── prometheus.yml            # Configuração de scraping
 ├── grafana/
@@ -107,6 +108,7 @@ O API Gateway só arranca depois de o healthcheck do Catalog passar, e o k6 só 
 | Catalog                  | http://localhost:8001 (documentação: http://localhost:8001/docs) |
 | Order                    | http://localhost:8002 (documentação: http://localhost:8002/docs) |
 | Notification             | http://localhost:8003/metrics                                      |
+| Payment                  | http://localhost:8004 (documentação: http://localhost:8004/docs) |
 | RabbitMQ (interface web) | http://localhost:15672 (ticketmei / ticketmei)                     |
 | RabbitMQ (métricas)     | http://localhost:15692/metrics                                     |
 | Prometheus               | http://localhost:9090                                              |
@@ -190,6 +192,47 @@ Não tem endpoints de negócio: consome as mensagens `OrderCreated` da fila `ord
 | `PREFETCH_COUNT`            | `10`       | Mensagens processadas em paralelo (~100 notificações/s)                   |
 | `NOTIFICATION_FAILURE_RATE` | `0`        | Percentagem de envios que falham de propósito (0 a 1), para demonstração |
 
+### Payment (porta 8004)
+
+Simula o sistema de pagamentos que cobra as compras (Parte II). Não é exposto pelo Gateway: só o Order o chama, dentro do circuit breaker. Tem falhas e latência configuráveis em tempo real, para testar o circuit breaker.
+
+| Método | Endpoint                       | Descrição                                                                                                  |
+| ------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| POST    | `/payments`                  | Processa o pagamento de uma compra: `{"order_id": "...", "amount": 170.0}`                                  |
+| POST    | `/payments/configure-faults` | Muda as falhas injetadas: `{"error_rate": 0.8}`, `{"latency_seconds": 10}` ou os dois. Só muda os campos enviados |
+| GET     | `/payments/configure-faults` | Configuração atual das falhas                                                                               |
+| GET     | `/payments/stats`            | Pagamentos por estado: `{"SUCCESS": n, "FAILED": n}` (usado na validação do teste das sagas)              |
+| GET     | `/payments/{id}`             | Um pagamento (404 se não existir)                                                                          |
+| GET     | `/health`, `/metrics`      | Estado do serviço e métricas no formato Prometheus                                                        |
+| GET     | `/docs`                      | Documentação interativa da API (Swagger UI)                                                                |
+
+| Resposta de `POST /payments` | Quando                                                                                                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `201 Created`                | Pagamento `SUCCESS`. Corpo: `id`, `order_id`, `amount`, `status`, `processed_at`; cabeçalho `Location`          |
+| `200 OK`                     | A compra já estava paga: devolve o mesmo pagamento sem cobrar outra vez (idempotência pelo `order_id`)          |
+| `500`                        | Falha injetada: `{"error": "Payment failed", "status": "FAILED"}`. A tentativa fica gravada como `FAILED`        |
+| `422`                        | `order_id` em falta, `amount` <= 0, ou valores fora dos limites no `configure-faults` (`error_rate` 0–1, `latency_seconds` >= 0) |
+
+- Cada pedido espera primeiro a latência configurada e só depois sorteia a falha com a taxa configurada.
+- **Idempotência:** um retry do Order depois de um timeout não cobra duas vezes. A base de dados também o garante, com um índice único que só deixa existir um pagamento `SUCCESS` por `order_id`.
+- **Um só processo:** a configuração das falhas vive na memória do processo. Com vários processos, o `configure-faults` só mudava o que recebeu o pedido, por isso o serviço recusa arrancar com `WEB_CONCURRENCY` diferente de 1. Para escalar usam-se réplicas.
+
+| Variável                    | Por omissão | Descrição                                                                    |
+| ---------------------------- | ------------ | ------------------------------------------------------------------------------ |
+| `PAYMENT_ERROR_RATE`       | `0`        | Taxa de erros no arranque (0 a 1)                                               |
+| `PAYMENT_LATENCY_SECONDS`  | `0`        | Latência no arranque, em segundos                                             |
+| `SQLITE_JOURNAL_MODE`      | `WAL`      | `WAL` no cluster local; `DELETE` no global (disco NFS)                       |
+| `WEB_CONCURRENCY`          | `1`        | Tem de ser 1                                                                    |
+
+Injetar e repor falhas (no PowerShell):
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8004/payments/configure-faults -ContentType "application/json" -Body '{"error_rate": 0.8}'
+Invoke-RestMethod -Method Post -Uri http://localhost:8004/payments/configure-faults -ContentType "application/json" -Body '{"error_rate": 0, "latency_seconds": 0}'
+```
+
+No cluster local: `kubectl port-forward svc/payment -n ticketmei 8004:8004`.
+
 ### Verificação rápida
 
 ```bash
@@ -255,6 +298,9 @@ A entrega é **at-least-once**: nenhuma notificação se perde, mas, se o Notifi
 | Order        | `order_request_duration_seconds`                                                               | Histogram | `endpoint`                              |
 | Notification | `notifications_processed_total`                                                                | Counter   | `status` (`SENT`, `FAILED`)         |
 | Notification | `notification_processing_duration_seconds`                                                     | Histogram | —                                        |
+| Payment      | `payment_requests_total` (só `POST /payments`)                                               | Counter   | `http_status`                           |
+| Payment      | `payment_processing_duration_seconds` (inclui a latência injetada; intervalos até 15 s)     | Histogram | —                                        |
+| Payment      | `payment_fault_error_rate`, `payment_fault_latency_seconds` (falhas configuradas)           | Gauge     | —                                        |
 | RabbitMQ     | `rabbitmq_detailed_queue_messages_ready`, `..._unacked` (tamanho da fila) e métricas gerais | —        | `queue`, ...                            |
 
 - O label `endpoint` guarda o template da rota (`/events`, `/events/{event_id}`) e não o caminho real, para que cada id não crie uma série temporal nova (cardinalidade controlada). Caminhos inexistentes ficam agrupados em `unmatched`.

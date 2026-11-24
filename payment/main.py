@@ -5,25 +5,39 @@ Simula o sistema de pagamentos (externo) que cobra as compras. O Order chama-o d
 (POST /payments) dentro de um circuit breaker.
 
 Endpoints:
-    POST /payments       -> processa o pagamento de uma compra -> 201 SUCCESS
-    GET  /payments/{id}  -> um pagamento (404 se não existir)
-    GET  /health         -> estado do serviço
-    GET  /metrics        -> métricas no formato Prometheus
+    POST /payments                   -> processa o pagamento de uma compra
+                                        201 SUCCESS, ou 500 FAILED quando a falha é injetada
+    POST /payments/configure-faults  -> muda a taxa de erros e/ou a latência -> 200 (422 fora dos limites)
+    GET  /payments/configure-faults  -> configuração atual das falhas
+    GET  /payments/stats             -> {"SUCCESS": n, "FAILED": n} (validação do teste das sagas)
+    GET  /payments/{id}              -> um pagamento (404 se não existir)
+    GET  /health                     -> estado do serviço
+    GET  /metrics                    -> métricas no formato Prometheus
+
+Falhas injetadas (para testar o circuit breaker do Order):
+    Cada POST /payments espera primeiro a latência configurada (asyncio.sleep) e só depois sorteia
+    a falha com a taxa configurada. Os valores iniciais vêm de PAYMENT_ERROR_RATE e
+    PAYMENT_LATENCY_SECONDS e mudam-se em tempo real com POST /payments/configure-faults.
 
 Modelo de dados (tabela payments, SQLite):
     id, order_id, amount, status (SUCCESS ou FAILED), processed_at
 """
 
+import asyncio
 import logging
 import os
+import random
 import sqlite3
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Configuração (variáveis de ambiente)
@@ -58,6 +72,44 @@ class Payment(BaseModel):
     amount: float
     status: str  # SUCCESS ou FAILED
     processed_at: str
+
+
+class FaultConfig(BaseModel):
+    """Falhas injetadas em cada POST /payments."""
+
+    # Probabilidade de um pagamento falhar (0 = nunca, 1 = sempre)
+    error_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
+    # Espera antes de responder, em segundos. allow_inf_nan=False: o JSON do Python aceita
+    # "Infinity", e um asyncio.sleep infinito deixaria os pedidos pendurados para sempre.
+    latency_seconds: float = Field(ge=0, allow_inf_nan=False)
+
+
+class FaultConfigUpdate(BaseModel):
+    """
+    Corpo de POST /payments/configure-faults. Só muda os campos enviados: o k6 envia
+    {"error_rate": 0.8} para injetar erros sem mexer na latência, e {0, 0} para repor tudo.
+    """
+
+    error_rate: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False, examples=[0.8])
+    latency_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False, examples=[10])
+
+    @model_validator(mode="after")
+    def at_least_one_field(self):
+        if self.error_rate is None and self.latency_seconds is None:
+            raise ValueError("Indique error_rate (0 a 1) e/ou latency_seconds (>= 0)")
+        return self
+
+
+def faults_from_env(env: Mapping[str, str]) -> FaultConfig:
+    """
+    Configuração inicial das falhas (PAYMENT_ERROR_RATE e PAYMENT_LATENCY_SECONDS, 0 por omissão).
+    Um valor inválido levanta ValueError e o serviço não arranca, em vez de arrancar com falhas
+    diferentes das pedidas.
+    """
+    return FaultConfig(
+        error_rate=float(env.get("PAYMENT_ERROR_RATE", "0")),
+        latency_seconds=float(env.get("PAYMENT_LATENCY_SECONDS", "0")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +151,13 @@ def find_payment(conn: sqlite3.Connection, payment_id: int) -> Payment | None:
     return Payment(**dict(row)) if row else None
 
 
+def payment_stats(conn: sqlite3.Connection) -> dict[str, int]:
+    counts = {"SUCCESS": 0, "FAILED": 0}
+    for row in conn.execute("SELECT status, COUNT(*) AS n FROM payments GROUP BY status"):
+        counts[row["status"]] = row["n"]
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Aplicação
 # ---------------------------------------------------------------------------
@@ -107,6 +166,11 @@ def find_payment(conn: sqlite3.Connection, payment_id: int) -> Payment | None:
 async def lifespan(app: FastAPI):
     app.state.db = open_database(PAYMENTS_DB_PATH)
     logger.info("Base de dados em %s", PAYMENTS_DB_PATH)
+
+    # A configuração das falhas vive na memória deste processo (por isso o serviço corre com um só)
+    app.state.faults = faults_from_env(os.environ)
+    logger.info("Falhas iniciais: error_rate=%s, latency_seconds=%s",
+                app.state.faults.error_rate, app.state.faults.latency_seconds)
     yield
     app.state.db.close()
 
@@ -123,12 +187,64 @@ def error(status_code: int, detail: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
-@app.post("/payments", status_code=201, response_model=Payment)
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """
+    422 igual ao do FastAPI, mas sem o campo "input" (o valor recebido). O JSON do Python aceita
+    Infinity e NaN, que o pydantic rejeita mas que não se conseguem escrever na resposta: com o
+    "input", um {"amount": Infinity} dava 500 em vez de 422.
+    """
+    errors = [{key: value for key, value in err.items() if key != "input"} for err in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
+@app.post(
+    "/payments",
+    status_code=201,
+    response_model=Payment,
+    responses={
+        422: {"description": "Pedido inválido (order_id em falta, amount <= 0)"},
+        500: {"description": "Falha injetada: o pagamento fica FAILED"},
+    },
+)
 async def create_payment(request: PaymentRequest) -> Response:
-    """Processa (simula) o pagamento de uma compra."""
+    """Processa (simula) o pagamento de uma compra, com as falhas configuradas."""
+    faults = app.state.faults
+
+    # 1.º a latência, depois o sorteio da falha: um pagamento lento pode também falhar
+    if faults.latency_seconds > 0:
+        await asyncio.sleep(faults.latency_seconds)
+
+    if random.random() < faults.error_rate:
+        insert_payment(app.state.db, request.order_id, request.amount, "FAILED")
+        return JSONResponse(status_code=500, content={"error": "Payment failed", "status": "FAILED"})
+
     payment = insert_payment(app.state.db, request.order_id, request.amount, "SUCCESS")
     return JSONResponse(status_code=201, content=payment.model_dump(),
                         headers={"Location": f"/payments/{payment.id}"})
+
+
+@app.post("/payments/configure-faults", response_model=FaultConfig,
+          responses={422: {"description": "error_rate fora de 0..1, latency_seconds negativa, ou nenhum campo"}})
+async def configure_faults(update: FaultConfigUpdate) -> FaultConfig:
+    """Muda as falhas injetadas (só os campos enviados) e devolve a configuração atual."""
+    app.state.faults = app.state.faults.model_copy(update=update.model_dump(exclude_none=True))
+    logger.info("Falhas configuradas: error_rate=%s, latency_seconds=%s",
+                app.state.faults.error_rate, app.state.faults.latency_seconds)
+    return app.state.faults
+
+
+@app.get("/payments/configure-faults", response_model=FaultConfig)
+async def get_faults() -> FaultConfig:
+    """Configuração atual das falhas injetadas."""
+    return app.state.faults
+
+
+# Declarado antes de /payments/{payment_id}, senão "stats" era lido como um id
+@app.get("/payments/stats")
+async def stats() -> dict[str, int]:
+    """Número de pagamentos por estado: {"SUCCESS": n, "FAILED": n}."""
+    return payment_stats(app.state.db)
 
 
 @app.get("/payments/{payment_id}", response_model=Payment, responses={404: {"description": "Pagamento não encontrado"}})

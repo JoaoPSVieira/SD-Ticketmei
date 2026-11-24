@@ -142,6 +142,23 @@ services:
     networks:
       - ticketmei-net  
 
+  payment:
+    build: ./payment
+    container_name: payment
+    environment:
+      # Falhas injetadas no arranque (0 a 1 e segundos). Mudam-se em tempo real, sem reiniciar, com
+      # POST http://localhost:8004/payments/configure-faults
+      - PAYMENT_ERROR_RATE=0
+      - PAYMENT_LATENCY_SECONDS=0
+    ports:
+      - "8004:8004"
+    volumes:
+      # Base de dados SQLite dos pagamentos: sobrevive a reinícios do contentor
+      - payment-data:/app/data
+    networks:
+      - ticketmei-net
+
 volumes:
   order-data:
   notification-logs:
+  payment-data:

@@ -5,8 +5,8 @@ Simula o sistema de pagamentos (externo) que cobra as compras. O Order chama-o d
 (POST /payments) dentro de um circuit breaker.
 
 Endpoints:
-    POST /payments                   -> processa o pagamento de uma compra
-                                        201 SUCCESS, ou 500 FAILED quando a falha é injetada
+    POST /payments                   -> processa o pagamento de uma compra: 201 SUCCESS, 500 FAILED
+                                        (falha injetada), 200 se a compra já estava paga (idempotente)
     POST /payments/configure-faults  -> muda a taxa de erros e/ou a latência -> 200 (422 fora dos limites)
     GET  /payments/configure-faults  -> configuração atual das falhas
     GET  /payments/stats             -> {"SUCCESS": n, "FAILED": n} (validação do teste das sagas)
@@ -21,6 +21,17 @@ Falhas injetadas (para testar o circuit breaker do Order):
 
 Modelo de dados (tabela payments, SQLite):
     id, order_id, amount, status (SUCCESS ou FAILED), processed_at
+
+Métricas (só de POST /payments):
+    payment_requests_total                Counter    labels: http_status
+    payment_processing_duration_seconds   Histogram  (inclui a latência injetada; intervalos até 15 s)
+    payment_fault_error_rate              Gauge      taxa de erros configurada
+    payment_fault_latency_seconds         Gauge      latência configurada
+
+Um só processo:
+    A configuração das falhas vive na memória do processo. Com vários processos, o configure-faults
+    só mudava o processo que recebeu o pedido; por isso o serviço recusa arrancar com WEB_CONCURRENCY
+    diferente de 1. Para escalar usam-se réplicas.
 """
 
 import asyncio
@@ -28,6 +39,7 @@ import logging
 import os
 import random
 import sqlite3
+import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -37,6 +49,7 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field, model_validator
 
 # ---------------------------------------------------------------------------
@@ -51,6 +64,20 @@ logger = logging.getLogger("payment")
 
 # Base de dados do Payment: um ficheiro SQLite (no contentor fica num volume)
 PAYMENTS_DB_PATH = Path(os.getenv("PAYMENTS_DB_PATH", Path(__file__).parent / "data" / "payments.db"))
+
+# Modo do diário do SQLite: WAL no cluster local; DELETE no global, porque o WAL não funciona bem
+# em discos de rede (o nfs-csi do cluster da UMa)
+SQLITE_JOURNAL_MODE = os.getenv("SQLITE_JOURNAL_MODE", "WAL")
+JOURNAL_MODES = {"WAL", "DELETE", "TRUNCATE", "PERSIST"}
+
+
+def check_single_process(env: Mapping[str, str]) -> None:
+    """Recusa arrancar com vários processos (ver "Um só processo" no início do ficheiro)."""
+    if env.get("WEB_CONCURRENCY", "1").strip() != "1":
+        raise RuntimeError(
+            "O Payment tem de correr com um só processo (WEB_CONCURRENCY=1): a configuração das falhas "
+            "fica na memória do processo. Para escalar, usar mais réplicas."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +161,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_one_success_per_order
 """
 
 
-def open_database(path: Path) -> sqlite3.Connection:
-    """Abre (e cria, se ainda não existir) a base de dados."""
+def open_database(path: Path, journal_mode: str = "WAL") -> sqlite3.Connection:
+    """
+    Abre (e cria, se ainda não existir) a base de dados.
+
+    - journal_mode: WAL (local) ou DELETE (cluster global, disco NFS). É validado contra uma lista
+      fechada antes de entrar no PRAGMA, que não aceita parâmetros.
+    - busy_timeout: se o ficheiro estiver ocupado, espera até 5 s em vez de dar erro.
+    """
+    mode = journal_mode.strip().upper()
+    if mode not in JOURNAL_MODES:
+        raise ValueError(f"SQLITE_JOURNAL_MODE inválido: {journal_mode!r} (usar um de {sorted(JOURNAL_MODES)})")
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5, isolation_level=None)  # isolation_level=None: cada comando é gravado logo
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA journal_mode={mode}")
+    if mode == "WAL":
+        conn.execute("PRAGMA synchronous=NORMAL")  # seguro em WAL e muito mais rápido
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(SCHEMA)
     conn.execute(ONE_SUCCESS_PER_ORDER)
@@ -172,18 +211,80 @@ def payment_stats(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Métricas Prometheus
+# ---------------------------------------------------------------------------
+
+PAYMENT_REQUESTS = Counter(
+    "payment_requests_total",
+    "Pedidos POST /payments, por código HTTP (201 SUCCESS, 500 falha injetada, 200 compra já paga, 422 inválido)",
+    ["http_status"],
+)
+# Cria as séries principais a zero logo no arranque, para os gráficos mostrarem 0 em vez de "No data"
+for _status in ("201", "500"):
+    PAYMENT_REQUESTS.labels(http_status=_status)
+
+PROCESSING_DURATION = Histogram(
+    "payment_processing_duration_seconds",
+    "Duração de cada POST /payments, incluindo a latência injetada, em segundos",
+    # Até 15 s, para o atraso de 10 s do teste do circuit breaker cair num intervalo próprio
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0),
+)
+
+# Mostram no dashboard quando a falha foi injetada e quando foi reposta
+FAULT_ERROR_RATE = Gauge("payment_fault_error_rate", "Taxa de erros injetada nos pagamentos (0 a 1)")
+FAULT_LATENCY = Gauge("payment_fault_latency_seconds", "Latência injetada em cada pagamento, em segundos")
+
+
+def set_faults(faults: FaultConfig) -> None:
+    app.state.faults = faults
+    FAULT_ERROR_RATE.set(faults.error_rate)
+    FAULT_LATENCY.set(faults.latency_seconds)
+    logger.info("Falhas: error_rate=%s, latency_seconds=%s", faults.error_rate, faults.latency_seconds)
+
+
+class MetricsMiddleware:
+    """
+    Mede os pedidos POST /payments (o mesmo desenho dos outros serviços). Os restantes endpoints
+    (configure-faults, stats, consultas) não contam, para o dashboard mostrar só pagamentos.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != "/payments":
+            await self.app(scope, receive, send)
+            return
+
+        status_code = 500  # se a aplicação rebentar antes de responder
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        start = time.perf_counter()
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            PAYMENT_REQUESTS.labels(http_status=str(status_code)).inc()
+            PROCESSING_DURATION.observe(time.perf_counter() - start)
+
+
+# ---------------------------------------------------------------------------
 # Aplicação
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = open_database(PAYMENTS_DB_PATH)
-    logger.info("Base de dados em %s", PAYMENTS_DB_PATH)
+    check_single_process(os.environ)
 
-    # A configuração das falhas vive na memória deste processo (por isso o serviço corre com um só)
-    app.state.faults = faults_from_env(os.environ)
-    logger.info("Falhas iniciais: error_rate=%s, latency_seconds=%s",
-                app.state.faults.error_rate, app.state.faults.latency_seconds)
+    app.state.db = open_database(PAYMENTS_DB_PATH, SQLITE_JOURNAL_MODE)
+    logger.info("Base de dados em %s (journal_mode=%s)", PAYMENTS_DB_PATH, SQLITE_JOURNAL_MODE)
+
+    # Configuração inicial das falhas, que fica na memória deste processo
+    set_faults(faults_from_env(os.environ))
     yield
     app.state.db.close()
 
@@ -194,6 +295,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.add_middleware(MetricsMiddleware)
 
 
 def error(status_code: int, detail: str) -> JSONResponse:
@@ -257,9 +359,7 @@ async def create_payment(request: PaymentRequest) -> Response:
           responses={422: {"description": "error_rate fora de 0..1, latency_seconds negativa, ou nenhum campo"}})
 async def configure_faults(update: FaultConfigUpdate) -> FaultConfig:
     """Muda as falhas injetadas (só os campos enviados) e devolve a configuração atual."""
-    app.state.faults = app.state.faults.model_copy(update=update.model_dump(exclude_none=True))
-    logger.info("Falhas configuradas: error_rate=%s, latency_seconds=%s",
-                app.state.faults.error_rate, app.state.faults.latency_seconds)
+    set_faults(app.state.faults.model_copy(update=update.model_dump(exclude_none=True)))
     return app.state.faults
 
 
@@ -289,3 +389,9 @@ async def get_payment(payment_id: int) -> Response:
 async def health() -> dict:
     """Indica se o serviço está pronto a responder."""
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    """Expõe as métricas para o Prometheus."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

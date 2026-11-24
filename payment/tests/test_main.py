@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
+from fastapi.testclient import TestClient
+from prometheus_client import REGISTRY
 
 import main
 from conftest import payment_request
@@ -273,3 +275,119 @@ def test_initial_faults_default_to_none():
 def test_invalid_initial_faults_stop_the_service():
     with pytest.raises(ValueError):
         main.faults_from_env({"PAYMENT_ERROR_RATE": "2"})
+
+
+# --- Métricas -------------------------------------------------------------------
+
+def payment_requests(http_status: str) -> float:
+    return REGISTRY.get_sample_value("payment_requests_total", {"http_status": http_status}) or 0.0
+
+
+def all_payment_requests() -> float:
+    return sum(payment_requests(code) for code in ("200", "201", "404", "422", "500"))
+
+
+def durations() -> tuple[float, float]:
+    """(número de observações, soma dos tempos) do payment_processing_duration_seconds."""
+    return (REGISTRY.get_sample_value("payment_processing_duration_seconds_count") or 0.0,
+            REGISTRY.get_sample_value("payment_processing_duration_seconds_sum") or 0.0)
+
+
+def test_metrics_endpoint_exposes_the_payment_metrics(client):
+    text = client.get("/metrics").text
+
+    assert 'payment_requests_total{http_status="201"}' in text
+    assert 'payment_requests_total{http_status="500"}' in text
+    assert "payment_processing_duration_seconds_bucket" in text
+    assert "payment_fault_error_rate" in text
+    assert "payment_fault_latency_seconds" in text
+
+
+def test_payment_requests_are_counted_by_http_status(client):
+    request = payment_request()
+    before = {code: payment_requests(code) for code in ("200", "201", "422", "500")}
+
+    client.post("/payments", json=request)                        # 201
+    client.post("/payments", json=request)                        # 200 (já paga)
+    client.post("/payments", json=payment_request(amount=-1))     # 422
+    configure(client, error_rate=1)
+    client.post("/payments", json=payment_request())              # 500
+
+    assert {code: payment_requests(code) - before[code] for code in before} == {
+        "200": 1, "201": 1, "422": 1, "500": 1,
+    }
+
+
+def test_only_post_payments_is_counted(client):
+    created = client.post("/payments", json=payment_request()).json()
+    before = all_payment_requests(), durations()[0]
+
+    client.get(f"/payments/{created['id']}")
+    client.get("/payments/stats")
+    client.get("/payments/configure-faults")
+    configure(client, error_rate=0)
+    client.get("/health")
+    client.get("/metrics")
+
+    assert (all_payment_requests(), durations()[0]) == before
+
+
+def test_processing_duration_includes_the_injected_latency(client):
+    configure(client, latency_seconds=0.3)
+    count_before, sum_before = durations()
+
+    client.post("/payments", json=payment_request())
+
+    count_after, sum_after = durations()
+    assert count_after == count_before + 1
+    assert sum_after - sum_before >= 0.3
+
+
+def test_duration_histogram_goes_up_to_15_seconds(client):
+    # Para apanhar o atraso de 10 s do teste do circuit breaker num intervalo próprio
+    text = client.get("/metrics").text
+
+    assert 'payment_processing_duration_seconds_bucket{le="10.0"}' in text
+    assert 'payment_processing_duration_seconds_bucket{le="15.0"}' in text
+
+
+def test_fault_gauges_follow_the_configuration(client):
+    assert REGISTRY.get_sample_value("payment_fault_error_rate") == 0.0
+    assert REGISTRY.get_sample_value("payment_fault_latency_seconds") == 0.0
+
+    configure(client, error_rate=0.8, latency_seconds=10)
+
+    assert REGISTRY.get_sample_value("payment_fault_error_rate") == 0.8
+    assert REGISTRY.get_sample_value("payment_fault_latency_seconds") == 10.0
+
+
+def test_fault_gauges_start_with_the_initial_configuration(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PAYMENTS_DB_PATH", tmp_path / "payments.db")
+    monkeypatch.setenv("PAYMENT_ERROR_RATE", "0.25")
+
+    with TestClient(main.app):
+        assert REGISTRY.get_sample_value("payment_fault_error_rate") == 0.25
+
+
+# --- SQLite e processos -----------------------------------------------------------
+
+@pytest.mark.parametrize("mode", ["WAL", "DELETE"])
+def test_journal_mode_is_configurable(tmp_path, mode):
+    # WAL no cluster local; DELETE no global, porque o WAL não funciona bem em discos de rede (NFS)
+    conn = main.open_database(tmp_path / "payments.db", journal_mode=mode)
+
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == mode.lower()
+    conn.close()
+
+
+def test_invalid_journal_mode_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        main.open_database(tmp_path / "payments.db", journal_mode="WAL; DROP TABLE payments")
+
+
+def test_the_service_refuses_to_run_with_more_than_one_process():
+    main.check_single_process({"WEB_CONCURRENCY": "1"})
+    main.check_single_process({})
+
+    with pytest.raises(RuntimeError):
+        main.check_single_process({"WEB_CONCURRENCY": "2"})

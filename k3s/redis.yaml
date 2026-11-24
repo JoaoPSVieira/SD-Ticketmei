@@ -11,6 +11,10 @@ metadata:
     app: redis
 spec:
   replicas: 1
+  # Recreate: a quota do grupo08 (CPU, PVCs) não deixa existir o pod antigo e o novo ao mesmo tempo
+  # (com RollingUpdate o pod novo ficava preso em "exceeded quota" e a atualização nunca terminava).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: redis

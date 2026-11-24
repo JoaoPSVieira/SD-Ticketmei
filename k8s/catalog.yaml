@@ -29,7 +29,7 @@ spec:
       containers:
         - name: catalog
           # A pipeline de CD (.github/workflows/cd.yml)
-          image: ghcr.io/joaopsvieira/ticketmei-catalog:a1a1a0bbb09829a351aa85d36552e292bf9c9a70
+          image: ghcr.io/joaopsvieira/ticketmei-catalog:1df2fe33c0c1c08d45e8abe1fb87ef669e077cb0
           imagePullPolicy: IfNotPresent
           env:
             - name: WEB_CONCURRENCY

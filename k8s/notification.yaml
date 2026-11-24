@@ -48,7 +48,7 @@ spec:
       containers:
         - name: notification
           # A pipeline de CD (.github/workflows/cd.yml)
-          image: ghcr.io/joaopsvieira/ticketmei-notification:65a54406fe9abb7712ff3994de8e3eadf59cfc81
+          image: ghcr.io/joaopsvieira/ticketmei-notification:be0a2304994d6140a33bc6bd0d7ff4f4b279b4c5
           imagePullPolicy: IfNotPresent
           env:
             - name: RABBITMQ_USER

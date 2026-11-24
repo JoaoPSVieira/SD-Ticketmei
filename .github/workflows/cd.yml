@@ -24,7 +24,7 @@ on:
 # Uma execução de cada vez: duas a mudar os manifestos ao mesmo tempo entrariam em conflito.
 # Uma execução que fique por fazer não faz mal: a seguinte apanha tudo o que estiver em atraso.
 concurrency:
-  group: cd
+  group: cd-parte2
   cancel-in-progress: false
 
 permissions:

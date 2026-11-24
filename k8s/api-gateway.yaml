@@ -38,7 +38,7 @@ spec:
             - name: ORDER_URL
               value: http://order:8002
             - name: ORDER_TIMEOUT_SECONDS
-              value: "10"
+              value: "5"
             # Rate limiter do POST /orders: baldes no Redis, 5 compras/s por cliente (IP), rajadas até 5
             - name: REDIS_URL
               value: redis://redis:6379/0

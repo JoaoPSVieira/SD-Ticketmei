@@ -24,11 +24,23 @@ spec:
         app: api-gateway
     spec:
       enableServiceLinks: false
+      # Pod Security "restricted" (cluster global): sem root e sem privilégios
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api-gateway
           # A pipeline de CD (.github/workflows/cd.yml)
           image: ghcr.io/joaopsvieira/ticketmei-api-gateway:ae6f7181159d74f6b7399210997c25a5a110dfcb
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             # Os outros serviços são encontrados pelo nome do Service (DNS do Kubernetes)
             - name: CATALOG_URL
@@ -37,8 +49,9 @@ spec:
               value: "2"
             - name: ORDER_URL
               value: http://order:8002
+            # 10 s: o Order agora espera pelo pagamento (com retries)
             - name: ORDER_TIMEOUT_SECONDS
-              value: "5"
+              value: "10"
             # Rate limiter do POST /orders: baldes no Redis, 5 compras/s por cliente (IP), rajadas até 5
             - name: REDIS_URL
               value: redis://redis:6379/0
@@ -80,8 +93,8 @@ spec:
             limits:
               memory: 512Mi
 ---
-# Tipo LoadBalancer: no Docker Desktop o Gateway fica em http://localhost:8000, como no compose.
-# Dentro do cluster (por exemplo, para o k6) o endereço é http://api-gateway:8000.
+# ClusterIP no cluster global (não há LoadBalancer para o nosso namespace): o endereço dentro do
+# cluster é http://api-gateway:8000. Para acesso de fora, ver a dúvida do Ingress à docente.
 apiVersion: v1
 kind: Service
 metadata:
@@ -90,7 +103,7 @@ metadata:
   labels:
     app: api-gateway
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: api-gateway
   ports:

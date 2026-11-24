@@ -26,11 +26,23 @@ spec:
         app: catalog
     spec:
       enableServiceLinks: false
+      # Pod Security "restricted" (cluster global): sem root e sem privilégios
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: catalog
           # A pipeline de CD (.github/workflows/cd.yml)
           image: ghcr.io/joaopsvieira/ticketmei-catalog:1df2fe33c0c1c08d45e8abe1fb87ef669e077cb0
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: WEB_CONCURRENCY
               value: "2"

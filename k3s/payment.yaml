@@ -7,7 +7,11 @@ kind: PersistentVolumeClaim
 metadata:
   name: payment-data
   namespace: grupo08
+  annotations:
+    # O Argo CD nunca apaga este disco (e os dados) num prune
+    argocd.argoproj.io/sync-options: Prune=false
 spec:
+  storageClassName: nfs-csi
   accessModes: [ReadWriteOnce]
   resources:
     requests:
@@ -62,9 +66,9 @@ spec:
               value: /app/data/payments.db
             - name: WEB_CONCURRENCY
               value: "1"
-            # WAL no cluster local; no global (disco NFS) usa-se DELETE
+            # No global (disco NFS) usa-se DELETE; o WAL fica só no cluster local
             - name: SQLITE_JOURNAL_MODE
-              value: WAL
+              value: DELETE
             # Falhas no arranque; mudam-se em tempo real com POST /payments/configure-faults
             - name: PAYMENT_ERROR_RATE
               value: "0"

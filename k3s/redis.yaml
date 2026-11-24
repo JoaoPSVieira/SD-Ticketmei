@@ -20,9 +20,21 @@ spec:
         app: redis
     spec:
       enableServiceLinks: false
+      # Pod Security "restricted" (cluster global): sem root e sem privilégios
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: redis
           image: redis:7.4-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           args: ["--save", "", "--appendonly", "no"]
           ports:
             - name: redis

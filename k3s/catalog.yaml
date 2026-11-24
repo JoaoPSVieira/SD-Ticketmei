@@ -75,6 +75,7 @@ spec:
               cpu: 50m
               memory: 128Mi
             limits:
+              cpu: 150m
               memory: 384Mi
 ---
 # Nome "catalog" no DNS do cluster (http://catalog:8001). Só é acessível dentro do cluster:

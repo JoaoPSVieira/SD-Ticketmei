@@ -91,6 +91,7 @@ spec:
               cpu: 25m
               memory: 64Mi
             limits:
+              cpu: 150m
               memory: 256Mi
       volumes:
         # emptyDir: a quota do grupo08 só permite 2 PVCs (já usados pelo Order e pelo Payment).

@@ -72,8 +72,28 @@ spec:
               value: amqp://$(RABBITMQ_USER):$(RABBITMQ_PASS)@rabbitmq:5672/
             - name: ORDERS_DB_PATH
               value: /app/data/orders.db
+            # Um só processo: o circuit breaker vive na memória do processo (ver order/Dockerfile)
             - name: WEB_CONCURRENCY
-              value: "2"
+              value: "1"
+            # Pagamento (Parte II): o Service do k8s/payment.yaml. Vazio = sem pagamento (as compras
+            # são confirmadas sem cobrar).
+            - name: PAYMENT_URL
+              value: http://payment:8004
+            # Cada tentativa espera no máximo 1 s; 3 tentativas com espera aleatória entre elas.
+            # Pior caso: ~3,3 s, abaixo dos 5 s que o Gateway espera pelo Order (ORDER_TIMEOUT_SECONDS)
+            - name: PAYMENT_TIMEOUT_SECONDS
+              value: "1"
+            - name: PAYMENT_RETRY_ATTEMPTS
+              value: "3"
+            - name: PAYMENT_RETRY_BASE_SECONDS
+              value: "0.1"
+            # Circuit breaker: abre com 5 falhas seguidas, fica aberto 15 s, depois 1 chamada de teste
+            - name: CB_FAILURE_THRESHOLD
+              value: "5"
+            - name: CB_OPEN_SECONDS
+              value: "15"
+            - name: CB_HALF_OPEN_MAX_CALLS
+              value: "1"
           ports:
             - name: http
               containerPort: 8002

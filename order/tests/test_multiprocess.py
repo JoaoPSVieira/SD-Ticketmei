@@ -3,6 +3,10 @@ Testes de integração com o Order a correr a sério com 2 processos (uvicorn --
 
 Confirmam que os dois processos partilham a mesma base de dados SQLite (uma compra criada por um
 processo é encontrada pelo outro) e que o /metrics soma as métricas dos dois.
+
+Na Parte II o Order corre com um só processo (cada processo teria o seu circuit breaker), mas a base
+de dados e as métricas continuam preparadas para vários. Aqui o pagamento está desligado
+(PAYMENT_URL vazio): o que se testa é a partilha da base de dados e das métricas.
 """
 
 import json
@@ -60,7 +64,7 @@ def initiated(base_url: str, status: str) -> float:
     )
 
 
-def start_order_service(tmp_path, fake_catalog_url, rabbitmq_url, queue):
+def start_order_service(tmp_path, fake_catalog_url, rabbitmq_url, queue, exchange="nao_usada"):
     port = free_port()
     metrics_dir = tmp_path / "metrics"
     metrics_dir.mkdir()
@@ -70,8 +74,11 @@ def start_order_service(tmp_path, fake_catalog_url, rabbitmq_url, queue):
         "ORDERS_DB_PATH": str(tmp_path / "orders.db"),
         "CATALOG_URL": fake_catalog_url,
         "RABBITMQ_URL": rabbitmq_url,
+        "ORDERS_EXCHANGE": exchange,
         "ORDER_QUEUE": queue,
+        "PAYMENT_URL": "",
     }
+    env.pop("RABBITMQ_HOST", None)
     # O log do Order fica num ficheiro, para ser mostrado se o teste falhar
     log_file = open(tmp_path / "order.log", "w")
     process = subprocess.Popen(
@@ -119,7 +126,7 @@ def create_orders_concurrently(base_url: str) -> list[tuple[int, dict]]:
 
 
 def test_workers_share_the_database_and_metrics(tmp_path, fake_catalog_url):
-    # Sem RabbitMQ (porta fechada): todas as compras ficam FAILED, mas ficam todas gravadas
+    # Sem RabbitMQ (porta fechada): as compras ficam CONFIRMED (sem email) e ficam todas gravadas
     process, base_url = start_order_service(
         tmp_path, fake_catalog_url, f"amqp://ticketmei:ticketmei@127.0.0.1:{free_port()}/", "nao_usada"
     )
@@ -127,17 +134,17 @@ def test_workers_share_the_database_and_metrics(tmp_path, fake_catalog_url):
         wait_until(process, base_url, rabbitmq_connected=False)
         results = create_orders_concurrently(base_url)
 
-        assert [status for status, _ in results] == [503] * ORDERS
-        ids = [payload["order"]["id"] for _, payload in results]
+        assert [status for status, _ in results] == [201] * ORDERS
+        ids = [payload["id"] for _, payload in results]
         assert len(set(ids)) == ORDERS
 
         # Cada compra é encontrada, seja qual for o processo que responde
         for order_id in ids:
             status, order = request("GET", f"{base_url}/orders/{order_id}")
             assert status == 200
-            assert order["status"] == "FAILED"
+            assert order["status"] == "CONFIRMED"
 
-        assert {initiated(base_url, "FAILED") for _ in range(10)} == {ORDERS}
+        assert {initiated(base_url, "CONFIRMED") for _ in range(10)} == {ORDERS}
     finally:
         process.terminate()
         process.wait(timeout=15)
@@ -146,19 +153,20 @@ def test_workers_share_the_database_and_metrics(tmp_path, fake_catalog_url):
 @pytest.mark.skipif(not rabbitmq_available(), reason="Sem RabbitMQ acessível em RABBITMQ_TEST_URL")
 def test_workers_publish_one_message_per_order(tmp_path, fake_catalog_url):
     queue = f"test_order_created_{uuid.uuid4().hex[:8]}"
-    process, base_url = start_order_service(tmp_path, fake_catalog_url, RABBITMQ_TEST_URL, queue)
+    exchange = f"test_orders_exchange_{uuid.uuid4().hex[:8]}"
+    process, base_url = start_order_service(tmp_path, fake_catalog_url, RABBITMQ_TEST_URL, queue, exchange)
     try:
         wait_until(process, base_url, rabbitmq_connected=True)
         results = create_orders_concurrently(base_url)
 
-        assert [status for status, _ in results] == [202] * ORDERS
+        assert [status for status, _ in results] == [201] * ORDERS
         ids = {payload["id"] for _, payload in results}
 
         messages = read_messages(queue)
         assert {json.loads(m.body)["order_id"] for m in messages} == ids
         assert len(messages) == ORDERS
-        assert {initiated(base_url, "PENDING") for _ in range(10)} == {ORDERS}
+        assert {initiated(base_url, "CONFIRMED") for _ in range(10)} == {ORDERS}
     finally:
         process.terminate()
         process.wait(timeout=15)
-        delete_queue(queue)
+        delete_queue(queue, exchange)

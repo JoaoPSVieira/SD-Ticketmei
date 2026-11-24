@@ -12,7 +12,7 @@ import { Counter } from 'k6/metrics';
 //
 // Fase 3: no Kubernetes o Gateway tem um rate limiter (5 compras/s por cliente) e todos os
 // utilizadores virtuais vêm do mesmo IP (o pod do k6). Por isso a maior parte das compras recebe
-// 429, o que é a resposta certa e não uma falha. No compose não há rate limiter: são todas 202.
+// 429, o que é a resposta certa e não uma falha. No compose não há rate limiter: são todas 201.
 // O resumo do k6 mostra quantas foram aceites e quantas foram limitadas.
 
 // 429 é uma resposta esperada: não conta para http_req_failed
@@ -63,8 +63,8 @@ export default function () {
 
   acceptedOrders.add(1);
   const accepted = check(created, {
-    'compra aceite (202)': (r) => r.status === 202,
-    'compra no estado PENDING': (r) => r.status === 202 && r.json('status') === 'PENDING',
+    'compra aceite (201)': (r) => r.status === 201,
+    'compra no estado CONFIRMED': (r) => r.status === 201 && r.json('status') === 'CONFIRMED',
   });
 
   if (accepted) {

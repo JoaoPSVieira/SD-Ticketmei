@@ -40,12 +40,16 @@ def read_messages(queue_name: str) -> list[aio_pika.abc.AbstractIncomingMessage]
     return asyncio.run(_read())
 
 
-def delete_queue(queue_name: str) -> None:
+def delete_queue(queue_name: str, exchange_name: str | None = None) -> None:
+    """Apaga a fila de teste (e a exchange de teste, se for dada)."""
+
     async def _delete():
         connection = await aio_pika.connect(RABBITMQ_TEST_URL)
         async with connection:
             channel = await connection.channel()
             await channel.queue_delete(queue_name)
+            if exchange_name is not None:
+                await channel.exchange_delete(exchange_name)
 
     asyncio.run(_delete())
 

@@ -103,15 +103,15 @@
             "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
           },
           "editorMode": "code",
-          "expr": "sum(increase(orders_initiated_total{status=\"PENDING\"}[$__range]))",
-          "legendFormat": "Compras aceites (PENDING)",
+          "expr": "sum(increase(orders_initiated_total{status=\"CONFIRMED\"}[$__range]))",
+          "legendFormat": "Compras confirmadas (CONFIRMED)",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Compras aceites (PENDING)",
+      "title": "Compras confirmadas (CONFIRMED)",
       "type": "stat",
-      "description": "Compras aceites no intervalo de tempo do dashboard."
+      "description": "Compras pagas e confirmadas no intervalo de tempo do dashboard."
     },
     {
       "datasource": {
@@ -341,7 +341,7 @@
             "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
           },
           "editorMode": "code",
-          "expr": "sum(rate(orders_initiated_total{status=\"PENDING\"}[1m]))",
+          "expr": "sum(rate(orders_initiated_total{status=\"CONFIRMED\"}[1m]))",
           "legendFormat": "Publicadas pelo Order",
           "range": true,
           "refId": "A"
@@ -563,7 +563,7 @@
       ],
       "title": "Compras iniciadas por estado (/s)",
       "type": "timeseries",
-      "description": "orders_initiated_total: PENDING (aceite e mensagem publicada) ou FAILED (RabbitMQ indisponível)."
+      "description": "orders_initiated_total: CONFIRMED (paga, confirmada e mensagem publicada) ou FAILED (pagamento falhou ou circuito aberto)."
     },
     {
       "datasource": {

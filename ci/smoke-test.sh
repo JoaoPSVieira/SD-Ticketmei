@@ -30,12 +30,12 @@ check_status "GET /events" 200 "$(curl -s -o "$TMP/body" -w '%{http_code}' "$GAT
 check_status "GET /events/evt-101" 200 "$(curl -s -o "$TMP/body" -w '%{http_code}' "$GATEWAY/events/evt-101")"
 check_status "GET /events/evt-999" 404 "$(curl -s -o "$TMP/body" -w '%{http_code}' "$GATEWAY/events/evt-999")"
 
-echo "Compras (Gateway -> Order -> Catalog, SQLite, RabbitMQ)"
+echo "Compras (Gateway -> Order -> Catalog, Payment, SQLite, RabbitMQ)"
 sent_before="$(sent_notifications)"
-check_status "POST /orders" 202 "$(curl -s -o "$TMP/body" -w '%{http_code}' -X POST "$GATEWAY/orders" \
+check_status "POST /orders" 201 "$(curl -s -o "$TMP/body" -w '%{http_code}' -X POST "$GATEWAY/orders" \
   -H 'Content-Type: application/json' \
   -d '{"customer_id":"ci","customer_email":"ci@exemplo.pt","event_id":"evt-101","quantity":2}')"
-[ "$(json "['status']")" = "PENDING" ] || fail "a compra devia ficar PENDING"
+[ "$(json "['status']")" = "CONFIRMED" ] || fail "a compra devia ficar CONFIRMED"
 [ "$(json "['total_amount']")" = "170.0" ] || fail "total_amount devia ser 170.0 (2 x 85)"
 order_id="$(json "['id']")"
 check_status "GET /orders/{id}" 200 "$(curl -s -o "$TMP/body" -w '%{http_code}' "$GATEWAY/orders/$order_id")"

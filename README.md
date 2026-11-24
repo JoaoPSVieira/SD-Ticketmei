@@ -32,7 +32,8 @@ flowchart LR
     ord -->|"HTTP síncrono<br/>(preço do evento)"| cat
     cat --- events[("events.json")]
     ord --- db[("SQLite<br/>orders.db")]
-    ord -->|"OrderCreated"| mq[["RabbitMQ<br/>fila order_created"]]
+    ord -->|"HTTP síncrono<br/>(circuit breaker + retry)"| pay["Payment<br/>:8004"]
+    ord -->|"OrderCreated"| mq[["RabbitMQ<br/>orders.exchange → fila order_created"]]
     mq -->|"assíncrono"| notif["Notification<br/>:8003"]
     notif --- log[("notifications.log")]
 
@@ -43,7 +44,7 @@ flowchart LR
 As linhas tracejadas são o Prometheus a recolher métricas (*scrape*) de cada componente.
 
 - Todo o tráfego dos clientes entra pelo **API Gateway**, que encaminha os pedidos de forma **síncrona**: os eventos para o **Catalog** e as compras para o **Order**.
-- O **Order** pergunta ao Catalog o preço do evento (síncrono), grava a compra como `PENDING` e publica a mensagem `OrderCreated` no **RabbitMQ**. Responde **202 Accepted** sem esperar pelo email.
+- O **Order** pergunta ao Catalog o preço do evento (síncrono), grava a compra como `PENDING` e cobra-a no **Payment** (síncrono, através de um *circuit breaker* com *retry* e *jitter*). Se o pagamento correr bem, a compra fica `CONFIRMED`, a mensagem `OrderCreated` é publicada na exchange `orders.exchange` do **RabbitMQ** e a resposta é **201 Created**, sem esperar pelo email.
 - O **Notification** consome a fila `order_created` de forma **assíncrona** e simula o envio do email de confirmação.
 - Cada serviço tem acesso exclusivo aos seus dados: o Catalog ao `events.json`, o Order à sua base de dados SQLite, o Notification ao seu log de entregas.
 - O **Prometheus** recolhe as métricas de todos os serviços, do RabbitMQ e do cAdvisor. O **Grafana** arranca com o datasource e os dashboards configurados (provisioning).
@@ -135,7 +136,7 @@ Comportamento quando um serviço falha:
 
 | Situação                                                           | Resposta do Gateway                                                                                                  |
 | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| O serviço responde 2xx ou 4xx (ex.: 202, 404, 422)                  | A mesma resposta, sem alterações                                                                                   |
+| O serviço responde 2xx ou 4xx (ex.: 201, 404, 422)                  | A mesma resposta, sem alterações                                                                                   |
 | O serviço responde 502, 503 ou 504                                  | A mesma resposta: é o próprio serviço a explicar o que falhou (ex.: o Order responde 503 com a compra `FAILED`) |
 | O serviço responde outro 5xx (ex.: 500, um erro inesperado)         | `502 Bad Gateway`                                                                                                  |
 | O serviço está inacessível (contentor parado, ligação recusada) | `502 Bad Gateway`                                                                                                  |
@@ -157,9 +158,9 @@ Configuração (variáveis de ambiente):
 
 | Método | Endpoint         | Descrição                                                                             |
 | ------- | ---------------- | --------------------------------------------------------------------------------------- |
-| POST    | `/orders`      | Cria uma compra no estado `PENDING` e publica a mensagem `OrderCreated` no RabbitMQ |
+| POST    | `/orders`      | Cria e cobra uma compra; se for paga, fica `CONFIRMED` e é publicada a mensagem `OrderCreated` no RabbitMQ |
 | GET     | `/orders/{id}` | Detalhes de uma compra (404 se não existir)                                            |
-| GET     | `/health`      | Estado do serviço e da ligação ao RabbitMQ                                           |
+| GET     | `/health`      | Estado do serviço, da ligação ao RabbitMQ e do circuito do Payment (`CLOSED`, `OPEN`, `HALF_OPEN` ou `disabled`) |
 | GET     | `/metrics`     | Métricas no formato Prometheus                                                         |
 | GET     | `/docs`        | Documentação interativa da API (Swagger UI)                                           |
 
@@ -171,10 +172,27 @@ Pedido `POST /orders`:
 
 | Resposta          | Quando                                                                                                                                                                              |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `202 Accepted`  | Compra registada como `PENDING` e mensagem publicada. O corpo tem a compra (`id`, `total_amount`, `status`, `created_at`, ...) e o cabeçalho `Location: /orders/{id}`. |
+| `201 Created`   | Compra paga e `CONFIRMED`. O corpo tem a compra (`id`, `total_amount`, `status`, `created_at`, ...) e o cabeçalho `Location: /orders/{id}`. |
 | `422`           | Campos em falta ou inválidos, email inválido, `quantity` fora de 1–4 (RF2), ou evento inexistente                                                                              |
-| `502` / `504` | O Catalog falhou ou não respondeu a tempo (não foi possível obter o preço)                                                                                                      |
-| `503`           | O RabbitMQ está indisponível. A compra fica gravada como `FAILED`, e o corpo inclui a compra.                                                                                   |
+| `502`           | O Catalog falhou (não foi possível obter o preço), ou o pagamento falhou em todas as tentativas: `{"error": "Payment failed", ...}`, compra `FAILED` |
+| `503`           | O circuito do Payment está aberto: `{"error": "Payment system unavailable, try again later"}`, compra `FAILED`, sem chamar o Payment       |
+| `504`           | O Catalog não respondeu a tempo                                                                                                                                                  |
+
+Se o RabbitMQ estiver em baixo, a compra paga continua `CONFIRMED` (201): só o email é que não é enviado, e a falha fica no log e na métrica `order_publish_failures_total`.
+
+#### Pagamento: circuit breaker e retry com jitter
+
+Cada tentativa de pagamento passa pelo *circuit breaker* (`order/circuit_breaker.py`). Com o circuito **fechado** as chamadas passam; ao fim de `CB_FAILURE_THRESHOLD` falhas seguidas (5xx, timeout ou erro de ligação) o circuito **abre** e o Order responde logo 503, sem chamar o Payment (*fail-fast*). Passados `CB_OPEN_SECONDS`, fica **semiaberto** e deixa passar uma chamada de teste: se correr bem fecha, se falhar volta a abrir. Entre tentativas o Order espera um tempo aleatório (*full jitter*), e deixa de tentar assim que o circuito abre. O Order corre com um só processo, porque cada processo teria o seu circuito.
+
+| Variável                     | Valor     | Descrição                                                                 |
+| ---------------------------- | --------- | ------------------------------------------------------------------------- |
+| `PAYMENT_URL`                | `http://payment:8004` (compose e `k8s/`) | Endereço do Payment. Vazio: compras confirmadas sem pagamento |
+| `PAYMENT_TIMEOUT_SECONDS`    | `1`       | Tempo máximo de cada tentativa. Mais lento do que isto conta como falha   |
+| `PAYMENT_RETRY_ATTEMPTS`     | `3`       | Tentativas no total (1 = sem retry)                                       |
+| `PAYMENT_RETRY_BASE_SECONDS` | `0.1`     | Base do intervalo aleatório entre tentativas (0,1 s, 0,2 s, 0,4 s, ...)   |
+| `CB_FAILURE_THRESHOLD`       | `5`       | Falhas seguidas que abrem o circuito                                       |
+| `CB_OPEN_SECONDS`            | `15`      | Tempo com o circuito aberto até à chamada de teste                         |
+| `CB_HALF_OPEN_MAX_CALLS`     | `1`       | Chamadas de teste no estado semiaberto                                     |
 
 O preço vem sempre do Catalog (`total_amount = price_eur × quantity`) e nunca do cliente. As compras ficam numa base de dados SQLite própria do Order, guardada num volume do Docker.
 
@@ -262,21 +280,21 @@ O smoke test do CI verifica tudo isto de uma vez (no Windows, no Git Bash): `bas
 
 ## Comunicação assíncrona (Order → RabbitMQ → Notification)
 
-O Order e o Notification comunicam só através da fila `order_created` do RabbitMQ. Nenhum dos dois chama o outro diretamente.
+O Order e o Notification comunicam só através do RabbitMQ: o Order publica na exchange `orders.exchange` e o Notification consome a fila `order_created`, ligada a essa exchange. Nenhum dos dois chama o outro diretamente.
 
 |              |                                                                                                                                        |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Exchange     | `orders.exchange`, do tipo *direct*, durável. O Order e o Notification declaram-na e ligam-lhe a fila com a routing key `order.created` (as mesmas declarações nos dois: não importa qual arranca primeiro) |
 | Fila         | `order_created`, durável. Os dois serviços declaram-na; declarar uma fila que já existe não faz nada.                            |
-| Exchange (Parte II) | `orders.exchange`, *direct* e durável, ligada à fila `order_created` pela routing key `order.created`. O Notification declara-a e faz a ligação; o Order da Parte II publica aí depois de a compra ficar `CONFIRMED`. A fila continua a receber o que chega pela exchange por omissão, por isso o Order da Parte I também funciona. |
-| Publicação | Exchange por omissão, `routing_key="order_created"`, mensagens persistentes, `type="OrderCreated"`, `message_id` = id da compra |
-| Corpo        | JSON: `type`, `order_id`, `customer_id`, `customer_email`, `event_id`, `quantity`, `total_amount`, `created_at`        |
+| Publicação | Exchange `orders.exchange`, `routing_key="order.created"`, mensagens persistentes, `type="OrderCreated"`, `message_id` = id da compra; só depois de a compra ficar `CONFIRMED` |
+| Corpo        | JSON: `type`, `order_id`, `customer_id`, `customer_email`, `event_id`, `quantity`, `total_amount`, `status`, `created_at`        |
 
 Garantias:
 
 | Mecanismo                               | Onde                 | O que garante                                                                                                                                                           |
 | --------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Fila durável + mensagens persistentes  | RabbitMQ             | As mensagens sobrevivem a um reinício do RabbitMQ                                                                                                                      |
-| *Publisher confirms*                  | Order                | O Order só considera a compra aceite depois de o RabbitMQ confirmar que guardou a mensagem. Se a publicação falhar, a compra fica `FAILED` e o cliente recebe 503. |
+| *Publisher confirms*                  | Order                | O Order só considera a mensagem publicada depois de o RabbitMQ confirmar que a guardou. Se a publicação falhar, a compra (já paga) continua `CONFIRMED` e a falha conta em `order_publish_failures_total`. |
 | *Ack* manual, só depois de processar | Notification         | Se o Notification for abaixo a meio, as mensagens não confirmadas voltam para a fila e são entregues de novo                                                          |
 | *Prefetch*                            | Notification         | No máximo `PREFETCH_COUNT` mensagens em processamento de cada vez                                                                                                    |
 | Religação automática                 | Order e Notification | Se o RabbitMQ reiniciar, os dois voltam a ligar sozinhos                                                                                                                |
@@ -296,7 +314,11 @@ A entrega é **at-least-once**: nenhuma notificação se perde, mas, se o Notifi
 | Catalog      | `catalog_requests_total`                                                                       | Counter   | `endpoint`, `http_status`             |
 | Catalog      | `catalog_request_duration_seconds`                                                             | Histogram | —                                        |
 | cAdvisor     | `container_cpu_usage_seconds_total`, `container_memory_usage_bytes`, ...                     | —        | `name` (nome do contentor), ...         |
-| Order        | `orders_initiated_total`                                                                       | Counter   | `status` (`PENDING`, `FAILED`)      |
+| Order        | `orders_initiated_total`                                                                       | Counter   | `status` (`CONFIRMED`, `FAILED`)    |
+| Order        | `circuit_breaker_state` (0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN)                                   | Gauge     | —                                        |
+| Order        | `circuit_breaker_fallbacks_total`                                                              | Counter   | —                                        |
+| Order        | `payment_client_requests_total`                                                                | Counter   | `status` (`2xx`, `500`, `timeout`, `error`, ...) |
+| Order        | `order_publish_failures_total`                                                                 | Counter   | —                                        |
 | Order        | `order_requests_total`                                                                         | Counter   | `method`, `endpoint`, `http_status` |
 | Order        | `order_request_duration_seconds`                                                               | Histogram | `endpoint`                              |
 | Notification | `notifications_processed_total`                                                                | Counter   | `status` (`SENT`, `FAILED`)         |
@@ -355,7 +377,7 @@ Dashboards:
 | Compras aceites / Notificações enviadas / Mensagens à espera                               | Totais no intervalo do dashboard e o tamanho atual da fila                                                        |
 | Fila order_created: entrada vs saída                                                         | Compras publicadas pelo Order vs notificações processadas. Se a entrada estiver acima da saída, a fila cresce. |
 | Mensagens na fila order_created                                                               | Mensagens em espera (*ready*) e em processamento (*unacked*), medidas pelo RabbitMQ                           |
-| Compras iniciadas por estado                                                                  | `orders_initiated_total` por `PENDING` / `FAILED`                                                           |
+| Compras iniciadas por estado                                                                  | `orders_initiated_total` por `CONFIRMED` / `FAILED`                                                         |
 | Notificações processadas por estado                                                         | `notifications_processed_total` por `SENT` / `FAILED`                                                       |
 | Latência de POST /orders (p95 & p99) e tempo de processamento das notificações (p50 & p95) |                                                                                                                   |
 | Respostas HTTP do Order por código e CPU por contentor                                       |                                                                                                                   |
@@ -439,10 +461,10 @@ Fase 2:
 
 | Ação                                       | Resultado                                                                                                                      |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `docker stop notification` e fazer compras | As compras continuam a ser aceites (202). As mensagens ficam à espera na fila e o painel "Mensagens na fila" sobe.            |
+| `docker stop notification` e fazer compras | As compras continuam a ser aceites (201). As mensagens ficam à espera na fila e o painel "Mensagens na fila" sobe.            |
 | `docker start notification`                | A fila esvazia e todas as compras recebem o email. Nenhuma se perde.                                                           |
-| `docker stop rabbitmq` e fazer uma compra  | `503`, compra `FAILED`. O Order e o Notification continuam `healthy`, com `"rabbitmq": "disconnected"` no `/health`. |
-| `docker start rabbitmq`                    | O Order e o Notification voltam a ligar sozinhos e as compras voltam a dar 202                                                 |
+| `docker stop rabbitmq` e fazer uma compra  | `201`, compra `CONFIRMED` sem email (`order_publish_failures_total` sobe). O Order e o Notification continuam `healthy`, com `"rabbitmq": "disconnected"` no `/health`. |
+| `docker start rabbitmq`                    | O Order e o Notification voltam a ligar sozinhos e as compras voltam a gerar email                                             |
 | `docker stop order` e fazer uma compra     | `502` do Gateway. Os eventos (`GET /events`) continuam a funcionar.                                                        |
 | `docker compose restart order`             | As compras anteriores continuam disponíveis (base de dados num volume)                                                        |
 
@@ -452,14 +474,15 @@ Fase 2:
 - **`aiohttp` como cliente HTTP no Gateway.** Num teste com o script k6 e 500 utilizadores virtuais, o `httpx` ficou em 261 pedidos/s com p95 de 4,6 s; o `aiohttp` chegou aos 2 118 pedidos/s com p95 de 174 ms, na mesma máquina.
 - **Uma única sessão HTTP com pool de ligações (keep-alive)** entre o Gateway e o Catalog, criada no arranque do Gateway, em vez de uma ligação nova por pedido.
 - **Timeout de 2 s** nas chamadas ao Catalog. Um Catalog bloqueado nunca prende o Gateway indefinidamente.
-- **Vários processos por contentor** (`WEB_CONCURRENCY`: 4 no Gateway, 2 no Catalog e no Order). Um processo Python só usa um core de cada vez, e com um só processo o Gateway não cumpria o p95 < 200 ms. Como as métricas do `prometheus_client` vivem na memória de cada processo, cada um escreve-as em ficheiros (`PROMETHEUS_MULTIPROC_DIR`) e o `/metrics` soma-as todas.
+- **Vários processos por contentor** (`WEB_CONCURRENCY`: 4 no Gateway, 2 no Catalog; o Order passou a 1 na Parte II, por causa do circuit breaker). Um processo Python só usa um core de cada vez, e com um só processo o Gateway não cumpria o p95 < 200 ms. Como as métricas do `prometheus_client` vivem na memória de cada processo, cada um escreve-as em ficheiros (`PROMETHEUS_MULTIPROC_DIR`) e o `/metrics` soma-as todas.
 - **O Catalog lê e valida o `events.json` uma vez no arranque** e guarda as respostas já serializadas em JSON. Os dados são estáticos e cada pedido só devolve bytes prontos.
 - **Healthchecks e `depends_on: condition: service_healthy`** para uma ordem de arranque correta.
 - **Contentores com utilizador sem privilégios** e imagens `python:3.13-slim`.
 - **Fase 2: SQLite para as compras**, num volume do Docker. Não precisa de mais um contentor e aguenta os 2 processos do Order em simultâneo (modo WAL). Limitação: o Order não pode ter várias réplicas.
 - **Fase 2: o preço vem do Catalog** (pedido síncrono do Order ao Catalog), nunca do cliente.
 - **Fase 2: `aio-pika` para o RabbitMQ**, com religação automática, *publisher confirms* no Order e *ack* manual com *prefetch* no Notification.
-- **Fase 2: a compra é gravada antes de publicar a mensagem.** Se a publicação falhar, fica `FAILED` (503). Limitação conhecida: se o Order morrer exatamente entre gravar e publicar, a compra fica `PENDING` sem mensagem (*dual write*). A solução seria o padrão *Transactional Outbox*.
+- **Fase 2: a compra é gravada antes de publicar a mensagem.** Na Parte I, se a publicação falhasse, ficava `FAILED` (503); na Parte II a compra já está paga quando é publicada, por isso continua `CONFIRMED` e só o email se perde. Limitação conhecida: se o Order morrer exatamente entre gravar e publicar, a compra fica `PENDING` sem mensagem (*dual write*). A solução seria o padrão *Transactional Outbox*.
+- **Parte II: circuit breaker escrito à mão** (`order/circuit_breaker.py`, cerca de 80 linhas) em vez de uma biblioteca: é fácil de testar e de explicar, e dá controlo direto sobre as métricas. Retry com *full jitter* e timeout de 1 s por tentativa, para o pior caso (~3,3 s) ficar abaixo dos 5 s que o Gateway espera pelo Order.
 - **Fase 2: o Gateway passa as respostas 502/503/504 dos serviços tal como vêm**, porque são o serviço a explicar o que falhou. Só um 500 (erro inesperado) é convertido em 502.
 - **Pipeline de CI (GitHub Actions)**: testes de todos os serviços (com um RabbitMQ verdadeiro), build das imagens, arranque do Compose, smoke test e testes k6 com carga reduzida.
 

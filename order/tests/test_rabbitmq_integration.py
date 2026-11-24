@@ -2,8 +2,9 @@
 Teste de integração com um RabbitMQ verdadeiro.
 
 Corre só se houver um RabbitMQ acessível em RABBITMQ_TEST_URL (por omissão o do docker compose,
-em localhost:5672, utilizador ticketmei). Caso contrário é saltado. Usa uma fila própria, com um
-nome único, que é apagada no fim: não interfere com a fila real nem com o Notification.
+em localhost:5672, utilizador ticketmei). Caso contrário é saltado. Usa uma exchange e uma fila
+próprias, com nomes únicos, que são apagadas no fim: não interfere com a fila real nem com o
+Notification. O pagamento está desligado (PAYMENT_URL vazio): aqui só interessa a mensagem.
 """
 
 import time
@@ -20,17 +21,25 @@ pytestmark = pytest.mark.skipif(not rabbitmq_available(), reason="Sem RabbitMQ a
 
 
 @pytest.fixture
-def queue_name():
-    name = f"test_order_created_{uuid.uuid4().hex[:8]}"
-    yield name
-    delete_queue(name)
+def exchange_name():
+    return f"test_orders_exchange_{uuid.uuid4().hex[:8]}"
 
 
 @pytest.fixture
-def connected_client(monkeypatch, tmp_path, fake_catalog_url, queue_name):
+def queue_name(exchange_name):
+    name = f"test_order_created_{uuid.uuid4().hex[:8]}"
+    yield name
+    delete_queue(name, exchange_name)
+
+
+@pytest.fixture
+def connected_client(monkeypatch, tmp_path, fake_catalog_url, queue_name, exchange_name):
     monkeypatch.setattr(main, "CATALOG_URL", fake_catalog_url)
     monkeypatch.setattr(main, "ORDERS_DB_PATH", tmp_path / "orders.db")
+    monkeypatch.setattr(main, "PAYMENT_URL", "")
+    monkeypatch.delenv("RABBITMQ_HOST", raising=False)
     monkeypatch.setattr(main, "RABBITMQ_URL", RABBITMQ_TEST_URL)
+    monkeypatch.setattr(main, "ORDERS_EXCHANGE", exchange_name)
     monkeypatch.setattr(main, "ORDER_QUEUE", queue_name)
 
     with TestClient(main.app) as client:
@@ -42,9 +51,9 @@ def connected_client(monkeypatch, tmp_path, fake_catalog_url, queue_name):
         yield client
 
 
-def test_order_created_message_reaches_the_queue(connected_client, queue_name):
+def test_order_created_message_reaches_the_queue_through_the_exchange(connected_client, queue_name):
     order = connected_client.post("/orders", json=VALID_ORDER).json()
-    assert order["status"] == "PENDING"
+    assert order["status"] == "CONFIRMED"
 
     [message] = read_messages(queue_name)
 
@@ -56,6 +65,7 @@ def test_order_created_message_reaches_the_queue(connected_client, queue_name):
         "event_id": "evt-101",
         "quantity": 2,
         "total_amount": 170.0,
+        "status": "CONFIRMED",
         "created_at": order["created_at"],
     }
     assert message.content_type == "application/json"

@@ -110,6 +110,16 @@ services:
     environment:
       - CATALOG_URL=http://catalog:8001
       - RABBITMQ_URL=amqp://ticketmei:ticketmei@rabbitmq:5672/
+      # Pagamento (Parte II): cada compra é cobrada no Payment, através do circuit breaker.
+      # Vazio = sem pagamento (compras confirmadas sem cobrar). Para ver o circuito abrir com um Payment
+      # inexistente: PAYMENT_URL=http://naoexiste:8004 docker compose up -d order
+      - PAYMENT_URL=${PAYMENT_URL-http://payment:8004}
+      - PAYMENT_TIMEOUT_SECONDS=1
+      - PAYMENT_RETRY_ATTEMPTS=3
+      - PAYMENT_RETRY_BASE_SECONDS=0.1
+      - CB_FAILURE_THRESHOLD=5
+      - CB_OPEN_SECONDS=15
+      - CB_HALF_OPEN_MAX_CALLS=1
     ports:
       - "8002:8002"
     volumes:
@@ -118,6 +128,8 @@ services:
       catalog:
         condition: service_healthy
       rabbitmq:
+        condition: service_healthy
+      payment:
         condition: service_healthy
     networks:
       - ticketmei-net

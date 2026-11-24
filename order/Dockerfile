@@ -14,7 +14,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY main.py .
+COPY main.py circuit_breaker.py ./
 
 # Utilizador sem privilégios. A pasta /app/data (onde fica a base de dados SQLite) pertence-lhe,
 # para que o volume do Docker montado nessa pasta herde estas permissões e o serviço possa escrever.
@@ -32,9 +32,11 @@ EXPOSE 8002
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
 
-# Vários processos para usar vários cores; as métricas de todos são somadas no /metrics
+# Um só processo: o circuit breaker das chamadas ao Payment vive na memória do processo, e com vários
+# processos cada um teria o seu (estados diferentes, métrica baralhada). Para escalar, usam-se réplicas.
+# O modo de métricas multiprocesso fica ativo, para o /metrics funcionar igual se se mudar WEB_CONCURRENCY.
 ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-metrics \
-    WEB_CONCURRENCY=2
+    WEB_CONCURRENCY=1
 
 # Limpa a pasta das métricas a cada arranque e arranca o uvicorn com WEB_CONCURRENCY processos
 CMD ["sh", "-c", "rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\" && exec uvicorn main:app --host 0.0.0.0 --port 8002 --workers \"$WEB_CONCURRENCY\" --no-access-log"]

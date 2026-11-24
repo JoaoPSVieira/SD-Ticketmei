@@ -4,6 +4,8 @@ Infraestrutura de testes do Order.
 - Catalog: um Catalog "falso" (servidor HTTP da biblioteca padrão) numa porta livre, com respostas
   controladas, incluindo erros difíceis de provocar no serviço real (500, lentidão, em baixo).
 - Base de dados: cada teste usa um ficheiro SQLite novo numa pasta temporária.
+- Payment: um Payment "falso", também numa porta livre, que responde conforme o modo escolhido em
+  cada teste (aceita, falha com 500, demora mais do que o timeout, recusa com 422) e conta os pedidos.
 - RabbitMQ: nos testes unitários não há RabbitMQ. A ligação em segundo plano é desligada e a
   publicação é substituída por uma função que guarda as mensagens numa lista (ou que falha).
   O teste com um RabbitMQ verdadeiro está em test_rabbitmq_integration.py.
@@ -73,6 +75,80 @@ def fake_catalog_url():
     server.shutdown()
 
 
+# Timeout do Payment nos testes, e quanto o Payment falso demora no modo "slow" (mais do que o timeout)
+PAYMENT_TEST_TIMEOUT = 0.3
+PAYMENT_SLOW_SECONDS = 0.6
+
+
+class FakePaymentHandler(BaseHTTPRequestHandler):
+    """
+    Simula o Payment (POST /payments). O comportamento muda com FakePaymentHandler.mode:
+
+    "ok"        201 com o pagamento (status SUCCESS)
+    "fail"      500 (falha injetada)
+    "fail_once" 500 no próximo pedido e depois passa a "ok"
+    "slow"   demora PAYMENT_SLOW_SECONDS a responder (mais do que o timeout do Order)
+    "reject" 422 (pedido inválido)
+    """
+
+    mode = "ok"
+    requests: list[dict] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        FakePaymentHandler.requests.append(body)
+        mode = FakePaymentHandler.mode
+        if mode == "fail_once":
+            # Falha só este pedido; os seguintes são aceites
+            FakePaymentHandler.mode = "ok"
+            mode = "fail"
+        if mode == "fail":
+            self._send(500, {"error": "Payment failed", "status": "FAILED"})
+        elif mode == "reject":
+            self._send(422, {"detail": "pedido inválido"})
+        else:
+            if mode == "slow":
+                time.sleep(PAYMENT_SLOW_SECONDS)
+            self._send(201, {"id": len(FakePaymentHandler.requests), "order_id": body.get("order_id"),
+                             "amount": body.get("amount"), "status": "SUCCESS",
+                             "processed_at": "2026-11-22T10:00:00+00:00"})
+
+    def _send(self, status: int, payload) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            # O Order desistiu (timeout) antes da resposta. No Linux é BrokenPipeError ou
+            # ConnectionResetError; no Windows é ConnectionAbortedError (WinError 10053).
+            pass
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture(scope="session")
+def fake_payment_url():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakePaymentHandler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+@pytest.fixture
+def payment():
+    """O Payment falso, a começar cada teste no modo "ok" e sem pedidos."""
+    FakePaymentHandler.mode = "ok"
+    FakePaymentHandler.requests = []
+    yield FakePaymentHandler
+    FakePaymentHandler.mode = "ok"
+
+
 def unused_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -92,20 +168,31 @@ def published():
 
 
 @pytest.fixture
-def make_client(monkeypatch, tmp_path, fake_catalog_url, published):
+def make_client(monkeypatch, tmp_path, fake_catalog_url, fake_payment_url, payment, published):
     """
     Cria um TestClient do Order.
 
     rabbitmq="ok":   a publicação funciona (as compras vão para a lista `published`)
     rabbitmq="down": sem ligação ao RabbitMQ (a função de publicação verdadeira falha)
+    payment_url:     por omissão o Payment falso; "" desliga o passo do pagamento
+    attempts, failure_threshold, open_seconds: configuração do retry e do circuit breaker
     """
 
     @contextmanager
     def _make(catalog_url: str | None = None, rabbitmq: str = "ok", catalog_timeout: float = 2.0,
-              db_path=None):
+              db_path=None, payment_url: str | None = None, attempts: int = 3, failure_threshold: int = 5,
+              open_seconds: float = 30.0, half_open_max_calls: int = 1,
+              payment_timeout: float = PAYMENT_TEST_TIMEOUT):
         monkeypatch.setattr(main, "CATALOG_URL", catalog_url or fake_catalog_url)
         monkeypatch.setattr(main, "CATALOG_TIMEOUT_SECONDS", catalog_timeout)
         monkeypatch.setattr(main, "ORDERS_DB_PATH", db_path or tmp_path / "orders.db")
+        monkeypatch.setattr(main, "PAYMENT_URL", fake_payment_url if payment_url is None else payment_url)
+        monkeypatch.setattr(main, "PAYMENT_TIMEOUT_SECONDS", payment_timeout)
+        monkeypatch.setattr(main, "PAYMENT_RETRY_ATTEMPTS", attempts)
+        monkeypatch.setattr(main, "PAYMENT_RETRY_BASE_SECONDS", 0.01)
+        monkeypatch.setattr(main, "CB_FAILURE_THRESHOLD", failure_threshold)
+        monkeypatch.setattr(main, "CB_OPEN_SECONDS", open_seconds)
+        monkeypatch.setattr(main, "CB_HALF_OPEN_MAX_CALLS", half_open_max_calls)
 
         async def no_rabbitmq_connection(app):
             return None

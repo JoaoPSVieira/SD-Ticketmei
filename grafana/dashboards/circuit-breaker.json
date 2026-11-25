@@ -1,0 +1,714 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Fase 1 (Parte II): estado do circuit breaker (0 CLOSED, 1 OPEN, 2 HALF_OPEN), fallbacks, chamadas ao Payment e latência p95.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "CLOSED (0)"
+                },
+                "1": {
+                  "color": "red",
+                  "index": 1,
+                  "text": "OPEN (1)"
+                },
+                "2": {
+                  "color": "yellow",
+                  "index": 2,
+                  "text": "HALF_OPEN (2)"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              },
+              {
+                "color": "yellow",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "max(circuit_breaker_state)",
+          "legendFormat": "Estado",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Estado atual do Circuit Breaker",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Taxa de erro configurada no Payment (0 a 1).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.1
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "max(payment_fault_error_rate)",
+          "legendFormat": "Error rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Payment: error_rate injetado",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Latência artificial configurada no Payment (segundos).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "max(payment_fault_latency_seconds)",
+          "legendFormat": "Latency",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Payment: latency_seconds injetado",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Total de pedidos rejeitados de imediato (fail-fast) com o circuito aberto.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(circuit_breaker_fallbacks_total[$__range]))",
+          "legendFormat": "Fallbacks",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Fallbacks (total no intervalo)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Evolução do estado: 0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "max": 2.2,
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "max(circuit_breaker_state)",
+          "legendFormat": "circuit_breaker_state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Estado do Circuit Breaker ao longo do tempo (0 / 1 / 2)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Tem de cair drasticamente quando o circuito passa para OPEN (fail-fast sem esperar pelo Payment).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum(rate(order_request_duration_seconds_bucket{endpoint=\"/orders\"}[30s])) by (le))",
+          "legendFormat": "p95 POST /orders",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum(rate(order_request_duration_seconds_bucket{endpoint=\"/orders\"}[30s])) by (le))",
+          "legendFormat": "p50 POST /orders",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Latência de POST /orders (p95 & p50)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Quando o circuito está OPEN, o Order não chama o Payment (esta taxa vai a 0) e sobem os fallbacks.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(payment_client_requests_total[30s])) by (status)",
+          "legendFormat": "cliente -> Payment ({{status}})",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(circuit_breaker_fallbacks_total[30s]))",
+          "legendFormat": "fallbacks (/s)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Order -> Payment (payment_client_requests_total) vs Fallbacks (/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Respostas HTTP do Payment por código (201, 200, 500) e falhas injetadas.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(payment_requests_total[30s])) by (http_status)",
+          "legendFormat": "Payment HTTP {{http_status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Payment: respostas HTTP por código (/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Evolução das falhas injetadas no Payment ao longo do teste.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "max(payment_fault_error_rate)",
+          "legendFormat": "payment_fault_error_rate (0..1)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "max(payment_fault_latency_seconds)",
+          "legendFormat": "payment_fault_latency_seconds (s)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Falhas configuradas no Payment ao longo do tempo",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+      },
+      "description": "Respostas do Order ao cliente/k6: 201 CONFIRMED, 502 Payment failed, 503 Circuit OPEN.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "auto"
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "a72340b1-d871-4028-bbf1-1795e3553e62"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(order_requests_total[30s])) by (http_status)",
+          "legendFormat": "Order HTTP {{http_status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Order: respostas HTTP por código (/s)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m"
+    ]
+  },
+  "timezone": "browser",
+  "title": "TicketMei - Circuit Breaker",
+  "uid": "ticketmei-circuit-breaker",
+  "version": 1,
+  "weekStart": ""
+}

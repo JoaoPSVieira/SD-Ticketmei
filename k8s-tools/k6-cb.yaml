@@ -1,0 +1,30 @@
+# Teste de carga k6 do circuit breaker (Parte II - C3):
+# 50 pedidos/s durante 6 minutos diretamente no Order, com injeção de falhas no Payment aos 2 min
+# e reposição aos 4 min. Corre-se à mão com:   .\k8s-tools\k6.ps1 cb
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-cb
+  namespace: ticketmei
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.49.0
+          args: ["run", "/scripts/circuit-breaker-test.js"]
+          env:
+            - name: ORDER_URL
+              value: http://order:8002
+            - name: PAYMENT_URL
+              value: http://payment:8004
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-scripts

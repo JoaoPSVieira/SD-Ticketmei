@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [catalog, api-gateway, order, notification]
+        service: [catalog, api-gateway, order, notification, payment]
 
     # RabbitMQ para os testes de integração do Order e do Notification (os outros não o usam)
     services:
@@ -89,7 +89,7 @@ jobs:
       # O cAdvisor e o Grafana não são precisos para os testes; os restantes arrancam pela ordem dos
       # healthchecks (depends_on) e o --wait espera até estarem todos healthy
       - name: Arrancar os serviços
-        run: docker compose up -d --wait --wait-timeout 240 catalog api-gateway order notification rabbitmq prometheus
+        run: docker compose up -d --wait --wait-timeout 240 catalog api-gateway order notification payment rabbitmq prometheus
 
       - name: Smoke test
         run: bash ci/smoke-test.sh
@@ -122,12 +122,19 @@ jobs:
       - name: Instalar o kubeconform
         run: curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar -xz kubeconform
 
-      - name: Validar os manifestos
+      - name: Validar os manifestos (k8s)
         run: >-
           ./kubeconform -strict -summary -kubernetes-version 1.33.0
           -schema-location default
           -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
           k8s/ k8s-tools/ argocd/
+
+      - name: Validar os manifestos (k3s)
+        run: >-
+          ./kubeconform -strict -ignore-missing-schemas -summary -kubernetes-version 1.33.0
+          -schema-location default
+          -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          k3s/
 
       - name: ConfigMaps da monitorização em dia
         run: python3 k8s-tools/gerar-configmaps.py --check

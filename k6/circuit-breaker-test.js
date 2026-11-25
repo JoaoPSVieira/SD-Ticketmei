@@ -1,20 +1,20 @@
-import http from 'k6/http';
+﻿import http from 'k6/http';
 import { check } from 'k6';
 import { Counter } from 'k6/metrics';
 
 // Teste de carga do Circuit Breaker (Parte II - C3):
 //   - 0m a 6m: 50 pedidos/s diretamente no Order (POST /orders)
-//   - aos 2m:  injeta falhas no Payment (error_rate: 0.8 por omissão)
-//   - aos 4m:  repõe o Payment sem falhas (error_rate: 0, latency_seconds: 0)
+//   - aos 2m:  injeta falhas no Payment (error_rate: 0.8 por omissÃ£o)
+//   - aos 4m:  repÃµe o Payment sem falhas (error_rate: 0, latency_seconds: 0)
 //
 // Correr no Docker Compose:
 //   docker compose run --rm k6 run circuit-breaker-test.js
-// Correr com latência de 10s em vez de erro 500:
+// Correr com latÃªncia de 10s em vez de erro 500:
 //   docker compose run --rm -e FAULT_ERROR_RATE=0 -e FAULT_LATENCY_SECONDS=10 k6 run circuit-breaker-test.js
 // Correr no cluster local (Kubernetes):
 //   .\k8s-tools\k6.ps1 cb
 
-// 201 (CONFIRMED), 502 (Payment failed) e 503 (Circuit OPEN) são respostas esperadas durante o ensaio
+// 201 (CONFIRMED), 502 (Payment failed) e 503 (Circuit OPEN) sÃ£o respostas esperadas durante o ensaio
 http.setResponseCallback(http.expectedStatuses(200, 201, 502, 503));
 
 const ordersConfirmed = new Counter('compras_201_confirmed');
@@ -23,8 +23,8 @@ const ordersCircuitOpen = new Counter('compras_503_circuit_open');
 
 const ORDER_URL = __ENV.ORDER_URL || __ENV.BASE_URL || 'http://order:8002';
 const PAYMENT_URL = __ENV.PAYMENT_URL || 'http://payment:8004';
-const FAULT_ERROR_RATE = Number(__ENV.FAULT_ERROR_RATE ?? 0.8);
-const FAULT_LATENCY_SECONDS = Number(__ENV.FAULT_LATENCY_SECONDS ?? 0);
+const FAULT_ERROR_RATE = __ENV.FAULT_ERROR_RATE !== undefined ? Number(__ENV.FAULT_ERROR_RATE) : 0.8;
+const FAULT_LATENCY_SECONDS = __ENV.FAULT_LATENCY_SECONDS !== undefined ? Number(__ENV.FAULT_LATENCY_SECONDS) : 0;
 
 const EVENTS = ['evt-101', 'evt-102', 'evt-103', 'evt-104'];
 const HEADERS = { 'Content-Type': 'application/json' };
@@ -79,7 +79,7 @@ export function criarCompra() {
   }
 
   check(res, {
-    'resposta válida do Order (201, 502 ou 503)': (r) =>
+    'resposta vÃ¡lida do Order (201, 502 ou 503)': (r) =>
       r.status === 201 || r.status === 502 || r.status === 503,
     '503 tem payload de circuito aberto': (r) =>
       r.status !== 503 || r.json('error') === 'Payment system unavailable, try again later',

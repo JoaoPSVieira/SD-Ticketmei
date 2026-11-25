@@ -157,7 +157,8 @@ def test_health_does_not_depend_on_rabbitmq(make_client):
         response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "rabbitmq": "disconnected", "payment": "CLOSED"}
+    assert response.json() == {"status": "ok", "rabbitmq": "disconnected", "payment": "CLOSED",
+                               "inventory": "disabled"}
 
 
 def test_health_shows_when_payment_is_disabled(make_client):

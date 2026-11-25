@@ -1,0 +1,1524 @@
+diff --git a/README.md b/README.md
+index 186ecfa..b5ecc15 100644
+--- a/README.md
++++ b/README.md
+@@ -158,9 +158,10 @@ Configuração (variáveis de ambiente):
+ 
+ | Método | Endpoint         | Descrição                                                                             |
+ | ------- | ---------------- | --------------------------------------------------------------------------------------- |
+-| POST    | `/orders`      | Cria e cobra uma compra; se for paga, fica `CONFIRMED` e é publicada a mensagem `OrderCreated` no RabbitMQ |
++| POST    | `/orders`      | Cria uma compra (Saga: reservar, cobrar, confirmar); se for paga, fica `CONFIRMED` e é publicada a mensagem `OrderCreated` no RabbitMQ |
++| GET     | `/orders/stats` | Contagens das compras e das sagas por estado (para validar os testes k6)              |
+ | GET     | `/orders/{id}` | Detalhes de uma compra (404 se não existir)                                            |
+-| GET     | `/health`      | Estado do serviço, da ligação ao RabbitMQ e do circuito do Payment (`CLOSED`, `OPEN`, `HALF_OPEN` ou `disabled`) |
++| GET     | `/health`      | Estado do serviço, da ligação ao RabbitMQ, do circuito do Payment (`CLOSED`, `OPEN`, `HALF_OPEN` ou `disabled`) e se o Inventory está ligado (`enabled` ou `disabled`) |
+ | GET     | `/metrics`     | Métricas no formato Prometheus                                                         |
+ | GET     | `/docs`        | Documentação interativa da API (Swagger UI)                                           |
+ 
+@@ -172,12 +173,15 @@ Pedido `POST /orders`:
+ 
+ | Resposta          | Quando                                                                                                                                                                              |
+ | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| `201 Created`   | Compra paga e `CONFIRMED`. O corpo tem a compra (`id`, `total_amount`, `status`, `created_at`, ...) e o cabeçalho `Location: /orders/{id}`. |
+-| `422`           | Campos em falta ou inválidos, email inválido, `quantity` fora de 1–4 (RF2), ou evento inexistente                                                                              |
+-| `502`           | O Catalog falhou (não foi possível obter o preço), ou o pagamento falhou em todas as tentativas: `{"error": "Payment failed", ...}`, compra `FAILED` |
+-| `503`           | O circuito do Payment está aberto: `{"error": "Payment system unavailable, try again later"}`, compra `FAILED`, sem chamar o Payment       |
++| `201 Created`   | Compra reservada, paga e `CONFIRMED`. O corpo tem a compra (`id`, `total_amount`, `status`, `created_at`, ...) e o cabeçalho `Location: /orders/{id}`. |
++| `409`           | Sem bilhetes suficientes: `{"error": "Not enough tickets", "order_id": ...}`, compra `FAILED`, sem cobrar                                                                     |
++| `422`           | Campos em falta ou inválidos, email inválido, `quantity` fora de 1–4 (RF2), evento inexistente, ou evento sem stock no Inventory                                               |
++| `502`           | O Catalog falhou (não foi possível obter o preço), ou o pagamento falhou em todas as tentativas: `{"error": "Payment failed", ...}`, bilhetes libertados, compra `CANCELLED` |
++| `503`           | O circuito do Payment está aberto: `{"error": "Payment system unavailable, try again later"}`, bilhetes libertados, compra `CANCELLED`, sem chamar o Payment; ou o Inventory está indisponível: `{"error": "Inventory unavailable, try again later", ...}`, compra `FAILED` |
+ | `504`           | O Catalog não respondeu a tempo                                                                                                                                                  |
+ 
++Enquanto o Inventory não estiver no sistema (`INVENTORY_URL` vazio), não há reserva nem nada a libertar: um pagamento falhado deixa a compra `FAILED` (como na Fase 1).
++
+ Se o RabbitMQ estiver em baixo, a compra paga continua `CONFIRMED` (201): só o email é que não é enviado, e a falha fica no log e na métrica `order_publish_failures_total`.
+ 
+ #### Pagamento: circuit breaker e retry com jitter
+@@ -194,6 +198,30 @@ Cada tentativa de pagamento passa pelo *circuit breaker* (`order/circuit_breaker
+ | `CB_OPEN_SECONDS`            | `15`      | Tempo com o circuito aberto até à chamada de teste                         |
+ | `CB_HALF_OPEN_MAX_CALLS`     | `1`       | Chamadas de teste no estado semiaberto                                     |
+ 
++#### Saga orquestrada (reservar → cobrar → confirmar)
++
++Cada compra é uma **Saga orquestrada pelo Order** (`order/saga.py`): o Order decide a ordem dos passos e, se um falhar, desfaz os anteriores. O Inventory e o Payment só recebem pedidos normais e não sabem que a saga existe.
++
++| Passo | Pedido | Se falhar |
++| --- | --- | --- |
++| 1. Reservar | `POST /inventory/reserve` | Sem bilhetes (409) ou evento sem stock (404): compra `FAILED`, nada a desfazer. Inventory indisponível: compra `FAILED` e liberta por segurança (a resposta da reserva pode ter-se perdido) |
++| 2. Cobrar | `POST /payments`, pelo circuit breaker | **Compensação:** `POST /inventory/release`, com até `COMPENSATION_RETRY_ATTEMPTS` tentativas e espera aleatória entre elas; compra `CANCELLED` |
++| 3. Confirmar | — (no Order) | — |
++
++- **Registo:** cada saga tem uma linha na tabela `sagas` (no mesmo SQLite das compras), gravada antes e depois de cada passo: o passo em que vai, se já reservou, se já pagou, o resultado e o erro.
++- **Compensação que falha:** se o Inventory não responder a nenhuma tentativa, a compra fica `CANCELLED` (não foi cobrada), a saga fica `COMPENSATION_FAILED` e o Order volta a tentar a libertação em segundo plano, de `SAGA_RECOVERY_SECONDS` em `SAGA_RECOVERY_SECONDS`.
++- **Recuperação no arranque:** se o Order parar a meio de uma saga, no arranque seguinte termina-a para a frente se já tinha pago (`CONFIRMED`), ou desfaz para trás se ainda não (liberta os bilhetes).
++- **Idempotência:** o Inventory e o Payment tratam um pedido repetido com o mesmo `order_id` como o mesmo pedido, por isso repetir uma reserva, um pagamento ou uma libertação nunca desconta, cobra ou repõe duas vezes. Uma libertação de uma compra sem reserva fica registada no Inventory, para uma reserva atrasada dessa compra ser recusada.
++
++| Variável                          | Valor  | Descrição                                                                 |
++| --------------------------------- | ------ | ------------------------------------------------------------------------- |
++| `INVENTORY_URL`                   | vazio (até haver Inventory) | Endereço do Inventory (`http://inventory:8005`). Vazio: sem passo de reserva |
++| `INVENTORY_TIMEOUT_SECONDS`       | `1`    | Tempo máximo de cada pedido ao Inventory                                  |
++| `COMPENSATION_RETRY_ATTEMPTS`     | `3`    | Tentativas da libertação dos bilhetes durante o pedido                    |
++| `COMPENSATION_RETRY_BASE_SECONDS` | `0.1`  | Base do intervalo aleatório entre essas tentativas                        |
++| `SAGA_RECOVERY_SECONDS`           | `10`   | De quanto em quanto tempo o Order volta a tentar as libertações que falharam (0 desliga) |
++| `SQLITE_JOURNAL_MODE`             | `WAL`  | `DELETE` no cluster global, porque o disco é NFS                          |
++
+ O preço vem sempre do Catalog (`total_amount = price_eur × quantity`) e nunca do cliente. As compras ficam numa base de dados SQLite própria do Order, guardada num volume do Docker.
+ 
+ ### Notification (porta 8003)
+@@ -314,11 +342,14 @@ A entrega é **at-least-once**: nenhuma notificação se perde, mas, se o Notifi
+ | Catalog      | `catalog_requests_total`                                                                       | Counter   | `endpoint`, `http_status`             |
+ | Catalog      | `catalog_request_duration_seconds`                                                             | Histogram | —                                        |
+ | cAdvisor     | `container_cpu_usage_seconds_total`, `container_memory_usage_bytes`, ...                     | —        | `name` (nome do contentor), ...         |
+-| Order        | `orders_initiated_total`                                                                       | Counter   | `status` (`CONFIRMED`, `FAILED`)    |
++| Order        | `orders_initiated_total`                                                                       | Counter   | `status` (`CONFIRMED`, `CANCELLED`, `FAILED`)    |
+ | Order        | `circuit_breaker_state` (0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN)                                   | Gauge     | —                                        |
+ | Order        | `circuit_breaker_fallbacks_total`                                                              | Counter   | —                                        |
+ | Order        | `payment_client_requests_total`                                                                | Counter   | `status` (`2xx`, `500`, `timeout`, `error`, ...) |
+ | Order        | `order_publish_failures_total`                                                                 | Counter   | —                                        |
++| Order        | `saga_transactions_initiated_total`, `saga_transactions_success_total`, `saga_transactions_aborted_total` | Counter   | —                                        |
++| Order        | `saga_compensations_executed_total`                                                            | Counter   | `outcome` (`success`, `failed`)          |
++| Order        | `saga_duration_seconds`                                                                        | Histogram | `outcome` (`success`, `compensated`, `aborted`) |
+ | Order        | `order_requests_total`                                                                         | Counter   | `method`, `endpoint`, `http_status` |
+ | Order        | `order_request_duration_seconds`                                                               | Histogram | `endpoint`                              |
+ | Notification | `notifications_processed_total`                                                                | Counter   | `status` (`SENT`, `FAILED`)         |
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 837c9a1..e398f9b 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -114,6 +114,10 @@ services:
+       # Vazio = sem pagamento (compras confirmadas sem cobrar). Para ver o circuito abrir com um Payment
+       # inexistente: PAYMENT_URL=http://naoexiste:8004 docker compose up -d order
+       - PAYMENT_URL=${PAYMENT_URL-http://payment:8004}
++      # Saga (Parte II, Fase 2): cada compra reserva os bilhetes no Inventory antes de cobrar. Vazio
++      # enquanto o Inventory não estiver no compose. Quando entrar: INVENTORY_URL=http://inventory:8005
++      # (ou só ${INVENTORY_URL-http://inventory:8005}) e o depends_on do inventory.
++      - INVENTORY_URL=${INVENTORY_URL-}
+       - PAYMENT_TIMEOUT_SECONDS=1
+       - PAYMENT_RETRY_ATTEMPTS=3
+       - PAYMENT_RETRY_BASE_SECONDS=0.1
+diff --git a/k8s/order.yaml b/k8s/order.yaml
+index 78c68fc..80c5194 100644
+--- a/k8s/order.yaml
++++ b/k8s/order.yaml
+@@ -79,6 +79,10 @@ spec:
+             # são confirmadas sem cobrar).
+             - name: PAYMENT_URL
+               value: http://payment:8004
++            # Saga (Parte II, Fase 2): reserva no Inventory antes de cobrar. Vazio enquanto não existir o
++            # k8s/inventory.yaml; depois: http://inventory:8005
++            - name: INVENTORY_URL
++              value: ""
+             # Cada tentativa espera no máximo 1 s; 3 tentativas com espera aleatória entre elas.
+             # Pior caso: ~3,3 s, abaixo dos 5 s que o Gateway espera pelo Order (ORDER_TIMEOUT_SECONDS)
+             - name: PAYMENT_TIMEOUT_SECONDS
+diff --git a/order/Dockerfile b/order/Dockerfile
+index 37270ec..e5e1b56 100644
+--- a/order/Dockerfile
++++ b/order/Dockerfile
+@@ -14,7 +14,7 @@ WORKDIR /app
+ COPY requirements.txt .
+ RUN pip install -r requirements.txt
+ 
+-COPY main.py circuit_breaker.py ./
++COPY main.py circuit_breaker.py saga.py ./
+ 
+ # Utilizador sem privilégios. A pasta /app/data (onde fica a base de dados SQLite) pertence-lhe,
+ # para que o volume do Docker montado nessa pasta herde estas permissões e o serviço possa escrever.
+diff --git a/order/main.py b/order/main.py
+index e7daf05..34ce3cb 100644
+--- a/order/main.py
++++ b/order/main.py
+@@ -1,17 +1,19 @@
+ """
+ TicketMEI - serviço Order
+ 
+-Recebe os pedidos de compra de bilhetes, regista cada compra numa base de dados própria (SQLite),
+-cobra a compra no serviço Payment e, se o pagamento correr bem, confirma-a e publica a mensagem
+-"OrderCreated" no RabbitMQ, para o serviço Notification enviar o email de confirmação.
++Recebe os pedidos de compra de bilhetes e regista cada compra numa base de dados própria (SQLite).
++Cada compra é uma Saga orquestrada pelo Order (saga.py): reserva os bilhetes no Inventory, cobra no
++Payment e confirma; se o pagamento falhar, liberta os bilhetes (compensação). Uma compra confirmada
++gera a mensagem "OrderCreated" no RabbitMQ, para o serviço Notification enviar o email.
+ 
+ As chamadas ao Payment passam por um circuit breaker com retry e jitter (circuit_breaker.py): se o
+ Payment estiver a falhar ou lento, o circuito abre e o Order responde logo 503, sem chamar o Payment.
+ 
+ Endpoints:
+-    POST /orders         -> cria e cobra uma compra -> 201 CONFIRMED, 502 ou 503 (FAILED)
++    POST /orders         -> cria uma compra (Saga) -> 201 CONFIRMED, 409/422/503 (FAILED) ou 502/503 (CANCELLED)
++    GET  /orders/stats   -> contagens das compras e das sagas por estado (validação dos testes k6)
+     GET  /orders/{id}    -> detalhes de uma compra (404 se não existir)
+-    GET  /health         -> estado do serviço (não depende do RabbitMQ, do Catalog nem do Payment)
++    GET  /health         -> estado do serviço (não depende do RabbitMQ, do Catalog, do Inventory nem do Payment)
+     GET  /metrics        -> métricas no formato Prometheus
+ 
+ Fluxo de POST /orders:
+@@ -19,19 +21,25 @@ Fluxo de POST /orders:
+     2. Pergunta ao Catalog o preço do evento (pedido síncrono)            -> 422 se o evento não existe,
+                                                                              502/504 se o Catalog falhar
+     3. Grava a compra como PENDING no SQLite
+-    4. Cobra no Payment (POST /payments), pelo circuit breaker e com retry:
+-         - pagamento aceite                -> CONFIRMED, segue para o passo 5
+-         - circuito aberto                 -> FAILED, 503 {"error": "Payment system unavailable, try again later"}
+-         - falhou em todas as tentativas   -> FAILED, 502 {"error": "Payment failed", ...}
++    4. Saga (saga.py):
++         a. Reserva no Inventory (POST /inventory/reserve)
++              - sem bilhetes                 -> FAILED, 409 {"error": "Not enough tickets"}
++              - evento sem stock             -> FAILED, 422
++              - Inventory indisponível       -> FAILED, 503 (liberta por segurança)
++         b. Cobra no Payment (POST /payments), pelo circuit breaker e com retry:
++              - circuito aberto              -> liberta os bilhetes, CANCELLED, 503 {"error": "Payment system unavailable, try again later"}
++              - falhou em todas as tentativas -> liberta os bilhetes, CANCELLED, 502 {"error": "Payment failed", ...}
++         c. Confirma                         -> CONFIRMED
+     5. Publica OrderCreated na exchange orders.exchange do RabbitMQ         -> 201 Created
+        Se a publicação falhar, a compra continua CONFIRMED (já foi paga): o email não é enviado e a
+        falha fica registada no log e na métrica order_publish_failures_total.
+ 
+-    Enquanto o Payment não existir no cluster, PAYMENT_URL fica vazio e o passo 4 não acontece: a
+-    compra é confirmada logo a seguir a ser gravada.
++    INVENTORY_URL ou PAYMENT_URL vazios desligam o passo respetivo. Sem Inventory não há nada a
++    libertar, por isso um pagamento falhado deixa a compra FAILED (como na Fase 1).
+ 
+ Métricas:
+-    orders_initiated_total            Counter    labels: status (CONFIRMED, FAILED)
++    orders_initiated_total            Counter    labels: status (CONFIRMED, CANCELLED, FAILED)
++    saga_transactions_*_total, saga_compensations_executed_total, saga_duration_seconds   (ver saga.py)
+     circuit_breaker_state             Gauge      0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN
+     circuit_breaker_fallbacks_total   Counter    tentativas recusadas pelo circuito (sem chamar o Payment)
+     payment_client_requests_total     Counter    labels: status (2xx, 500, timeout, error, ...)
+@@ -72,7 +80,9 @@ from prometheus_client import (
+ )
+ from pydantic import BaseModel, Field
+ 
++import saga
+ from circuit_breaker import CircuitBreaker, State, full_jitter_delay
++from saga import InventoryClient, PaymentFailedError, PaymentUnavailableError, PurchaseSaga, SagaOutcome
+ 
+ # ---------------------------------------------------------------------------
+ # Configuração (variáveis de ambiente)
+@@ -99,6 +109,16 @@ PAYMENT_TIMEOUT_SECONDS = float(os.getenv("PAYMENT_TIMEOUT_SECONDS", "1"))
+ PAYMENT_RETRY_ATTEMPTS = int(os.getenv("PAYMENT_RETRY_ATTEMPTS", "3"))
+ PAYMENT_RETRY_BASE_SECONDS = float(os.getenv("PAYMENT_RETRY_BASE_SECONDS", "0.1"))
+ 
++# Serviço Inventory (Parte II, Fase 2). Vazio: sem passo de reserva (enquanto o Inventory não existir).
++INVENTORY_URL = os.getenv("INVENTORY_URL", "").rstrip("/")
++INVENTORY_TIMEOUT_SECONDS = float(os.getenv("INVENTORY_TIMEOUT_SECONDS", "1"))
++
++# Saga: tentativas da compensação (libertar os bilhetes) e de quanto em quanto tempo o Order volta a
++# tentar, em segundo plano, as compensações que falharam (0 desliga)
++COMPENSATION_RETRY_ATTEMPTS = int(os.getenv("COMPENSATION_RETRY_ATTEMPTS", "3"))
++COMPENSATION_RETRY_BASE_SECONDS = float(os.getenv("COMPENSATION_RETRY_BASE_SECONDS", "0.1"))
++SAGA_RECOVERY_SECONDS = float(os.getenv("SAGA_RECOVERY_SECONDS", "10"))
++
+ # Circuit breaker: abre com N falhas seguidas, fica aberto X segundos, depois deixa passar M chamadas de teste
+ CB_FAILURE_THRESHOLD = int(os.getenv("CB_FAILURE_THRESHOLD", "5"))
+ CB_OPEN_SECONDS = float(os.getenv("CB_OPEN_SECONDS", "15"))
+@@ -116,12 +136,16 @@ RABBITMQ_RETRY_SECONDS = float(os.getenv("RABBITMQ_RETRY_SECONDS", "2"))
+ 
+ # Base de dados do Order: um ficheiro SQLite (no contentor fica num volume do Docker)
+ ORDERS_DB_PATH = Path(os.getenv("ORDERS_DB_PATH", Path(__file__).parent / "data" / "orders.db"))
++# WAL no cluster local; DELETE no cluster global, porque o disco é NFS e o WAL não funciona bem em discos de rede
++SQLITE_JOURNAL_MODE = os.getenv("SQLITE_JOURNAL_MODE", "WAL").upper()
+ 
+ # RF2: limite de bilhetes por compra
+ MAX_TICKETS_PER_ORDER = int(os.getenv("MAX_TICKETS_PER_ORDER", "4"))
+ 
+ # Resposta do enunciado quando o circuito está aberto
+ PAYMENT_UNAVAILABLE = {"error": "Payment system unavailable, try again later"}
++NOT_ENOUGH_TICKETS = {"error": "Not enough tickets"}
++INVENTORY_UNAVAILABLE = {"error": "Inventory unavailable, try again later"}
+ 
+ 
+ def rabbitmq_url() -> str:
+@@ -186,22 +210,24 @@ CREATE TABLE IF NOT EXISTS orders (
+ """
+ 
+ 
+-def open_database(path: Path) -> sqlite3.Connection:
++def open_database(path: Path, journal_mode: str = "WAL") -> sqlite3.Connection:
+     """
+     Abre (e cria, se ainda não existir) a base de dados.
+ 
+     - WAL (Write-Ahead Logging): vários processos podem ler enquanto outro escreve, e as escritas
+-      de processos diferentes ficam em fila em vez de falharem.
++      de processos diferentes ficam em fila em vez de falharem. synchronous=NORMAL é seguro em WAL.
++    - Em discos de rede (NFS, no cluster global) usa-se SQLITE_JOURNAL_MODE=DELETE, o modo clássico,
++      com synchronous=FULL (o valor seguro fora do WAL).
+     - busy_timeout: se outro processo estiver a escrever, espera até 5 s em vez de dar erro.
+-    - synchronous=NORMAL: seguro em modo WAL e muito mais rápido do que o valor por omissão.
+     """
+     path.parent.mkdir(parents=True, exist_ok=True)
+     conn = sqlite3.connect(path, timeout=5, isolation_level=None)  # isolation_level=None: cada comando é gravado logo
+     conn.row_factory = sqlite3.Row
+-    conn.execute("PRAGMA journal_mode=WAL")
+-    conn.execute("PRAGMA synchronous=NORMAL")
++    conn.execute(f"PRAGMA journal_mode={journal_mode}")
++    conn.execute("PRAGMA synchronous=NORMAL" if journal_mode == "WAL" else "PRAGMA synchronous=FULL")
+     conn.execute("PRAGMA busy_timeout=5000")
+     conn.execute(SCHEMA)
++    conn.execute(saga.SAGA_SCHEMA)
+     return conn
+ 
+ 
+@@ -213,10 +239,6 @@ def insert_order(conn: sqlite3.Connection, order: Order) -> None:
+     )
+ 
+ 
+-def update_status(conn: sqlite3.Connection, order_id: str, status: str) -> None:
+-    conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+-
+-
+ def find_order(conn: sqlite3.Connection, order_id: str) -> Order | None:
+     row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+     return Order(**dict(row)) if row else None
+@@ -228,11 +250,12 @@ def find_order(conn: sqlite3.Connection, order_id: str) -> Order | None:
+ 
+ ORDERS_INITIATED = Counter(
+     "orders_initiated_total",
+-    "Compras iniciadas, por estado em que ficaram (CONFIRMED: paga e confirmada; FAILED: pagamento falhou)",
++    "Compras iniciadas, por estado em que ficaram (CONFIRMED: paga e confirmada; CANCELLED: o pagamento falhou "
++    "e os bilhetes foram libertados; FAILED: falhou sem nada reservado)",
+     ["status"],
+ )
+ # Cria as séries a zero logo no arranque, para os gráficos mostrarem 0 em vez de "No data"
+-for _status in ("CONFIRMED", "FAILED"):
++for _status in ("CONFIRMED", "CANCELLED", "FAILED"):
+     ORDERS_INITIATED.labels(status=_status)
+ 
+ CIRCUIT_BREAKER_STATE = Gauge(
+@@ -436,12 +459,12 @@ async def fetch_event_price(app: FastAPI, event_id: str) -> float:
+ # Payment (circuit breaker e retry com jitter)
+ # ---------------------------------------------------------------------------
+ 
+-class CircuitOpenError(Exception):
++class CircuitOpenError(PaymentUnavailableError):
+     """O circuito está aberto: o pagamento nem foi tentado (fail-fast)."""
+ 
+ 
+-class PaymentFailedError(Exception):
+-    """O Payment recusou ou falhou em todas as tentativas."""
++# PaymentFailedError (o Payment recusou ou falhou em todas as tentativas) vem de saga.py: são os dois
++# erros do passo de pagamento que a saga sabe tratar.
+ 
+ 
+ class PaymentAttemptError(Exception):
+@@ -536,14 +559,27 @@ async def charge_payment(app: FastAPI, order: Order) -> dict:
+ # Aplicação
+ # ---------------------------------------------------------------------------
+ 
++async def keep_retrying_compensations(app: FastAPI) -> None:
++    """Em segundo plano: volta a tentar as libertações de bilhetes que falharam (Inventory em baixo)."""
++    while True:
++        await asyncio.sleep(SAGA_RECOVERY_SECONDS)
++        try:
++            done = await app.state.saga.retry_failed_compensations()
++            if done:
++                logger.info("Compensações pendentes concluídas: %d", done)
++        except Exception:
++            logger.exception("Erro ao voltar a tentar as compensações pendentes")
++
++
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+     # Base de dados: uma ligação por processo
+-    app.state.db = open_database(ORDERS_DB_PATH)
+-    logger.info("Base de dados em %s", ORDERS_DB_PATH)
++    app.state.db = open_database(ORDERS_DB_PATH, SQLITE_JOURNAL_MODE)
++    logger.info("Base de dados em %s (journal_mode=%s)", ORDERS_DB_PATH, SQLITE_JOURNAL_MODE)
+ 
+-    # Clientes HTTP para o Catalog e para o Payment, com ligações reutilizadas (como no Gateway)
++    # Clientes HTTP para o Catalog, o Inventory e o Payment, com ligações reutilizadas (como no Gateway)
+     app.state.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CATALOG_TIMEOUT_SECONDS))
++    app.state.inventory_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=INVENTORY_TIMEOUT_SECONDS))
+     app.state.payment_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=PAYMENT_TIMEOUT_SECONDS))
+ 
+     # Circuit breaker das chamadas ao Payment (um por processo)
+@@ -556,6 +592,26 @@ async def lifespan(app: FastAPI):
+     else:
+         logger.warning("PAYMENT_URL vazio: as compras são confirmadas sem passar pelo Payment")
+ 
++    # Saga: o orquestrador da compra
++    inventory = InventoryClient(app.state.inventory_http, INVENTORY_URL) if INVENTORY_URL else None
++    app.state.saga = PurchaseSaga(
++        app.state.db,
++        inventory,
++        (lambda order: charge_payment(app, order)) if PAYMENT_URL else None,
++        compensation_attempts=COMPENSATION_RETRY_ATTEMPTS,
++        compensation_base_seconds=COMPENSATION_RETRY_BASE_SECONDS,
++    )
++    if INVENTORY_URL:
++        logger.info("Reservas no Inventory em %s (timeout %gs)", INVENTORY_URL, INVENTORY_TIMEOUT_SECONDS)
++    else:
++        logger.warning("INVENTORY_URL vazio: as compras não reservam bilhetes no Inventory")
++    # Sagas que ficaram a meio da última vez que o Order parou (antes de aceitar pedidos novos)
++    recovered = app.state.saga.recover_interrupted()
++    if recovered:
++        logger.warning("Sagas interrompidas fechadas no arranque: %d", recovered)
++    recovery_task = (asyncio.create_task(keep_retrying_compensations(app))
++                     if INVENTORY_URL and SAGA_RECOVERY_SECONDS > 0 else None)
++
+     # RabbitMQ: liga em segundo plano, para o serviço não ficar bloqueado se o RabbitMQ demorar
+     app.state.amqp_channel = None
+     app.state.amqp_connection = None
+@@ -564,21 +620,25 @@ async def lifespan(app: FastAPI):
+ 
+     yield
+ 
+-    connect_task.cancel()
+-    with suppress(asyncio.CancelledError):
+-        await connect_task
++    for task in (connect_task, recovery_task):
++        if task is not None:
++            task.cancel()
++            with suppress(asyncio.CancelledError):
++                await task
+     if app.state.amqp_connection is not None:
+         await app.state.amqp_connection.close()
+     await app.state.payment_http.close()
++    await app.state.inventory_http.close()
+     await app.state.http.close()
+     app.state.db.close()
+ 
+ 
+ app = FastAPI(
+     title="TicketMEI - Order",
+-    description="Compras de bilhetes. Cada compra é cobrada no Payment (com circuit breaker) e, se for paga, "
+-                "fica CONFIRMED e gera uma mensagem OrderCreated no RabbitMQ.",
+-    version="2.0.0",
++    description="Compras de bilhetes. Cada compra é uma Saga orquestrada pelo Order: reserva no Inventory, "
++                "cobra no Payment (com circuit breaker) e confirma; se o pagamento falhar, liberta os bilhetes. "
++                "Uma compra confirmada gera a mensagem OrderCreated no RabbitMQ.",
++    version="3.0.0",
+     lifespan=lifespan,
+ )
+ app.add_middleware(MetricsMiddleware)
+@@ -588,10 +648,19 @@ def error(status_code: int, detail: str, **extra) -> JSONResponse:
+     return JSONResponse(status_code=status_code, content={"detail": detail, **extra})
+ 
+ 
+-def fail_order(order: Order) -> None:
+-    update_status(app.state.db, order.id, "FAILED")
+-    order.status = "FAILED"
+-    ORDERS_INITIATED.labels(status="FAILED").inc()
++def saga_failure_response(order: Order, result: saga.SagaResult) -> JSONResponse:
++    """Resposta HTTP de uma saga que não terminou em CONFIRMED."""
++    outcome = result.outcome
++    if outcome is SagaOutcome.NOT_ENOUGH_TICKETS:
++        return JSONResponse(status_code=409, content={**NOT_ENOUGH_TICKETS, "order_id": order.id})
++    if outcome is SagaOutcome.UNKNOWN_EVENT:
++        return error(422, f"O evento '{order.event_id}' não tem bilhetes à venda", order_id=order.id)
++    if outcome is SagaOutcome.INVENTORY_UNAVAILABLE:
++        return JSONResponse(status_code=503, content={**INVENTORY_UNAVAILABLE, "order_id": order.id})
++    if outcome is SagaOutcome.PAYMENT_UNAVAILABLE:
++        return JSONResponse(status_code=503, content=PAYMENT_UNAVAILABLE)
++    return JSONResponse(status_code=502, content={"error": "Payment failed", "order_id": order.id,
++                                                  "reason": result.reason})
+ 
+ 
+ @app.post(
+@@ -599,15 +668,18 @@ def fail_order(order: Order) -> None:
+     status_code=201,
+     response_model=Order,
+     responses={
+-        422: {"description": "Pedido inválido (campos, email, mais de 4 bilhetes) ou evento inexistente"},
+-        502: {"description": "Catalog indisponível, ou pagamento falhou em todas as tentativas (compra FAILED)"},
+-        503: {"description": "Circuito do Payment aberto (compra FAILED): "
+-                             "{\"error\": \"Payment system unavailable, try again later\"}"},
++        409: {"description": "Sem bilhetes suficientes (compra FAILED): {\"error\": \"Not enough tickets\"}"},
++        422: {"description": "Pedido inválido (campos, email, mais de 4 bilhetes), evento inexistente ou sem stock"},
++        502: {"description": "Catalog indisponível, ou pagamento falhou em todas as tentativas "
++                             "(compra CANCELLED, bilhetes libertados)"},
++        503: {"description": "Circuito do Payment aberto (compra CANCELLED): "
++                             "{\"error\": \"Payment system unavailable, try again later\"}; "
++                             "ou Inventory indisponível (compra FAILED)"},
+         504: {"description": "Catalog não respondeu a tempo"},
+     },
+ )
+ async def create_order(request: OrderRequest) -> Response:
+-    """Cria uma compra, cobra-a no Payment e, se for paga, confirma-a e publica OrderCreated."""
++    """Cria uma compra e corre a Saga: reservar, cobrar e confirmar (ou libertar os bilhetes)."""
+     try:
+         price = await fetch_event_price(app, request.event_id)
+     except CatalogError as exc:
+@@ -623,23 +695,14 @@ async def create_order(request: OrderRequest) -> Response:
+         status="PENDING",
+         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+     )
+-    # A compra fica gravada antes de cobrar: se o pagamento falhar, fica registada como FAILED
++    # A compra fica gravada antes da saga: se algum passo falhar, fica registada como FAILED ou CANCELLED
+     insert_order(app.state.db, order)
+ 
+-    if PAYMENT_URL:
+-        try:
+-            await charge_payment(app, order)
+-        except CircuitOpenError:
+-            fail_order(order)
+-            return JSONResponse(status_code=503, content=PAYMENT_UNAVAILABLE)
+-        except PaymentFailedError as exc:
+-            fail_order(order)
+-            return JSONResponse(status_code=502, content={"error": "Payment failed", "order_id": order.id,
+-                                                          "reason": str(exc)})
+-
+-    update_status(app.state.db, order.id, "CONFIRMED")
+-    order.status = "CONFIRMED"
+-    ORDERS_INITIATED.labels(status="CONFIRMED").inc()
++    result = await app.state.saga.run(order)
++    order.status = result.order_status
++    ORDERS_INITIATED.labels(status=result.order_status).inc()
++    if result.outcome is not SagaOutcome.CONFIRMED:
++        return saga_failure_response(order, result)
+ 
+     # A compra já está paga e confirmada: se a mensagem não puder ser publicada, a compra não muda,
+     # só o email de confirmação é que não é enviado (fica no log e na métrica)
+@@ -652,6 +715,18 @@ async def create_order(request: OrderRequest) -> Response:
+     return JSONResponse(status_code=201, content=order.model_dump(), headers={"Location": f"/orders/{order.id}"})
+ 
+ 
++@app.get("/orders/stats")
++async def order_stats() -> dict:
++    """
++    Contagens das compras e das sagas por estado. Serve para validar o teste k6 das sagas (por exemplo:
++    com 20 bilhetes e 1000 compradores, 20 CONFIRMED e 980 FAILED). Tem de vir antes de /orders/{id}.
++    """
++    orders = dict.fromkeys(("PENDING", "CONFIRMED", "CANCELLED", "FAILED"), 0)
++    for row in app.state.db.execute("SELECT status, COUNT(*) AS n FROM orders GROUP BY status"):
++        orders[row["status"]] = row["n"]
++    return {"orders": orders, "sagas": saga.count_sagas(app.state.db)}
++
++
+ @app.get("/orders/{order_id}", response_model=Order, responses={404: {"description": "Compra não encontrada"}})
+ async def get_order(order_id: str) -> Response:
+     """Devolve os detalhes de uma compra."""
+@@ -664,13 +739,15 @@ async def get_order(order_id: str) -> Response:
+ @app.get("/health")
+ async def health() -> dict:
+     """
+-    Indica se o serviço está a funcionar. Não falha se o RabbitMQ ou o Payment estiverem em baixo (o
+-    Order continua a responder); mostra o estado da ligação ao RabbitMQ e do circuito do Payment.
++    Indica se o serviço está a funcionar. Não falha se o RabbitMQ, o Inventory ou o Payment estiverem em
++    baixo (o Order continua a responder); mostra o estado da ligação ao RabbitMQ, do circuito do Payment
++    e se o passo do Inventory está ligado.
+     """
+     return {
+         "status": "ok",
+         "rabbitmq": "connected" if rabbitmq_is_connected(app) else "disconnected",
+         "payment": app.state.breaker.state.name if PAYMENT_URL else "disabled",
++        "inventory": "enabled" if INVENTORY_URL else "disabled",
+     }
+ 
+ 
+diff --git a/order/saga.py b/order/saga.py
+new file mode 100644
+index 0000000..f9603ed
+--- /dev/null
++++ b/order/saga.py
+@@ -0,0 +1,400 @@
++"""
++TicketMEI - Saga orquestrada da compra (Parte II, Fase 2)
++
++O Order é o orquestrador: decide a ordem dos passos e, se um passo falhar, desfaz os anteriores
++(compensação). Nenhum outro serviço sabe que a saga existe: o Inventory e o Payment só recebem
++pedidos normais.
++
++    Passo         Pedido                                   Compensação
++    1. Reservar   POST /inventory/reserve  (Inventory)     POST /inventory/release
++    2. Cobrar     POST /payments           (Payment)       - (é o último passo que pode falhar)
++    3. Confirmar  compra CONFIRMED         (Order)         -
++
++    Sem bilhetes (409) ou evento sem stock (404)  -> compra FAILED, nada a compensar
++    Inventory indisponível                       -> compra FAILED; liberta por segurança (ver abaixo)
++    Pagamento falhou ou circuito aberto          -> liberta os bilhetes, compra CANCELLED
++
++Registo (tabela `sagas`, no mesmo SQLite das compras): uma linha por compra, gravada antes e depois
++de cada passo, com o passo em que vai, se já reservou, se já pagou e o resultado. Serve para:
++    - saber onde ficou uma saga se o Order reiniciar a meio (recover_interrupted, no arranque);
++    - voltar a tentar as compensações que falharam (retry_failed_compensations, em segundo plano);
++    - as contagens de GET /orders/stats, usadas para validar o teste k6 das sagas.
++
++Idempotência: o Inventory e o Payment tratam um pedido repetido com o mesmo order_id como o mesmo
++pedido. Por isso o Order pode repetir uma reserva, um pagamento ou uma libertação sem descontar,
++cobrar ou repor duas vezes. É isto que torna seguro "libertar por segurança" quando a resposta de uma
++reserva se perdeu (timeout): se a reserva não chegou a acontecer, o release responde released=false.
++
++Se INVENTORY_URL estiver vazio (Inventory ainda não existe), o passo 1 não acontece e a saga fica só
++com o pagamento e a confirmação, como na Fase 1: um pagamento falhado deixa a compra FAILED.
++"""
++
++import asyncio
++import logging
++import sqlite3
++import time
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from enum import Enum
++from typing import Awaitable, Callable
++
++import aiohttp
++from prometheus_client import Counter, Histogram
++
++from circuit_breaker import full_jitter_delay
++
++logger = logging.getLogger("order")
++
++
++# ---------------------------------------------------------------------------
++# Registo das sagas (SQLite)
++# ---------------------------------------------------------------------------
++
++SAGA_SCHEMA = """
++CREATE TABLE IF NOT EXISTS sagas (
++    order_id    TEXT PRIMARY KEY,
++    status      TEXT NOT NULL CHECK (status IN
++                    ('RUNNING', 'SUCCEEDED', 'ABORTED', 'COMPENSATED', 'COMPENSATION_FAILED')),
++    step        TEXT NOT NULL CHECK (step IN ('RESERVE', 'PAY', 'CONFIRM', 'RELEASE', 'DONE')),
++    reserved    INTEGER NOT NULL DEFAULT 0,   -- 1: o Inventory pode ter bilhetes reservados para a compra
++    paid        INTEGER NOT NULL DEFAULT 0,   -- 1: o Payment aceitou o pagamento
++    started_at  TEXT NOT NULL,
++    finished_at TEXT,
++    error       TEXT
++)
++"""
++
++SAGA_STATUSES = ("RUNNING", "SUCCEEDED", "ABORTED", "COMPENSATED", "COMPENSATION_FAILED")
++
++
++def now_iso() -> str:
++    return datetime.now(timezone.utc).isoformat(timespec="seconds")
++
++
++def start_saga(conn: sqlite3.Connection, order_id: str, first_step: str) -> None:
++    conn.execute(
++        "INSERT INTO sagas (order_id, status, step, started_at) VALUES (?, 'RUNNING', ?, ?)",
++        (order_id, first_step, now_iso()),
++    )
++
++
++def update_saga(conn: sqlite3.Connection, order_id: str, **fields) -> None:
++    """Grava o progresso da saga (passo, reserved, paid, error) antes de avançar."""
++    columns = ", ".join(f"{name} = ?" for name in fields)
++    conn.execute(f"UPDATE sagas SET {columns} WHERE order_id = ?", (*fields.values(), order_id))
++
++
++def finish_saga(conn: sqlite3.Connection, order_id: str, saga_status: str, order_status: str | None,
++                error: str | None = None) -> None:
++    """Fecha a saga e muda o estado da compra na mesma transação: os dois ficam sempre de acordo."""
++    conn.execute("BEGIN IMMEDIATE")
++    try:
++        conn.execute(
++            "UPDATE sagas SET status = ?, step = 'DONE', finished_at = ?, error = COALESCE(?, error) "
++            "WHERE order_id = ?",
++            (saga_status, now_iso(), error, order_id),
++        )
++        if order_status is not None:
++            conn.execute("UPDATE orders SET status = ? WHERE id = ?", (order_status, order_id))
++        conn.execute("COMMIT")
++    except Exception:
++        conn.execute("ROLLBACK")
++        raise
++
++
++def find_saga(conn: sqlite3.Connection, order_id: str) -> dict | None:
++    row = conn.execute("SELECT * FROM sagas WHERE order_id = ?", (order_id,)).fetchone()
++    return dict(row) if row else None
++
++
++def count_sagas(conn: sqlite3.Connection) -> dict[str, int]:
++    counts = dict.fromkeys(SAGA_STATUSES, 0)
++    for row in conn.execute("SELECT status, COUNT(*) AS n FROM sagas GROUP BY status"):
++        counts[row["status"]] = row["n"]
++    return counts
++
++
++# ---------------------------------------------------------------------------
++# Métricas (nomes do enunciado)
++# ---------------------------------------------------------------------------
++
++SAGA_INITIATED = Counter("saga_transactions_initiated_total", "Sagas de compra iniciadas")
++SAGA_SUCCESS = Counter("saga_transactions_success_total", "Sagas que terminaram com a compra CONFIRMED")
++SAGA_ABORTED = Counter(
++    "saga_transactions_aborted_total",
++    "Sagas que não terminaram em CONFIRMED (sem bilhetes, Inventory indisponível, pagamento falhado ou circuito aberto)",
++)
++SAGA_COMPENSATIONS = Counter(
++    "saga_compensations_executed_total",
++    "Compensações (libertar os bilhetes reservados) por resultado: success, ou failed se o Inventory não "
++    "respondeu em nenhuma tentativa (o Order volta a tentar em segundo plano e, se conseguir, conta success)",
++    ["outcome"],
++)
++for _outcome in ("success", "failed"):
++    SAGA_COMPENSATIONS.labels(outcome=_outcome)
++
++SAGA_DURATION = Histogram(
++    "saga_duration_seconds",
++    "Duração das sagas, por resultado: success (CONFIRMED), compensated (houve libertação dos bilhetes) "
++    "ou aborted (falhou sem nada a compensar)",
++    ["outcome"],
++    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
++)
++for _outcome in ("success", "compensated", "aborted"):
++    SAGA_DURATION.labels(outcome=_outcome)
++
++
++# ---------------------------------------------------------------------------
++# Inventory (cliente HTTP)
++# ---------------------------------------------------------------------------
++
++class InventoryError(Exception):
++    def __init__(self, reason: str):
++        super().__init__(reason)
++        self.reason = reason
++
++
++class NotEnoughTicketsError(InventoryError):
++    """409: o evento não tem bilhetes suficientes. Não ficou nada reservado."""
++
++
++class UnknownEventError(InventoryError):
++    """404: o Inventory não tem stock definido para este evento. Não ficou nada reservado."""
++
++
++class InventoryUnavailableError(InventoryError):
++    """5xx, timeout, erro de ligação ou resposta inesperada: não se sabe se a reserva ficou feita."""
++
++
++class InventoryClient:
++    """Os dois pedidos que a saga faz ao Inventory. Ambos são idempotentes pelo order_id."""
++
++    def __init__(self, session: aiohttp.ClientSession, base_url: str):
++        self.session = session
++        self.base_url = base_url.rstrip("/")
++
++    async def _post(self, path: str, body: dict) -> tuple[int, dict]:
++        try:
++            async with self.session.post(f"{self.base_url}{path}", json=body) as response:
++                try:
++                    payload = await response.json(content_type=None)
++                except ValueError:
++                    payload = {}
++                return response.status, payload if isinstance(payload, dict) else {}
++        except asyncio.TimeoutError:
++            raise InventoryUnavailableError("timeout") from None
++        except aiohttp.ClientError as exc:
++            raise InventoryUnavailableError(f"erro de ligação ({type(exc).__name__})") from None
++
++    async def reserve(self, order_id: str, event_id: str, quantity: int) -> dict:
++        status, payload = await self._post(
++            "/inventory/reserve", {"order_id": order_id, "event_id": event_id, "quantity": quantity}
++        )
++        if status == 200:
++            return payload
++        if status == 409:
++            raise NotEnoughTicketsError("sem bilhetes suficientes")
++        if status == 404:
++            raise UnknownEventError(f"o evento '{event_id}' não tem stock no Inventory")
++        raise InventoryUnavailableError(f"HTTP {status}")
++
++    async def release(self, order_id: str) -> bool:
++        """Liberta os bilhetes da compra. Devolve True se havia uma reserva para libertar."""
++        status, payload = await self._post("/inventory/release", {"order_id": order_id})
++        if status == 200:
++            return bool(payload.get("released", False))
++        raise InventoryUnavailableError(f"HTTP {status}")
++
++
++
++# ---------------------------------------------------------------------------
++# Passo do pagamento: o Order (main.py) liga aqui o circuit breaker
++# ---------------------------------------------------------------------------
++
++class PaymentStepError(Exception):
++    """O passo de pagamento falhou."""
++
++
++class PaymentUnavailableError(PaymentStepError):
++    """O pagamento nem foi tentado (no Order: o circuit breaker está aberto)."""
++
++
++class PaymentFailedError(PaymentStepError):
++    """O Payment recusou ou falhou em todas as tentativas."""
++
++
++Charge = Callable[[object], Awaitable[object]]
++
++
++# ---------------------------------------------------------------------------
++# O orquestrador
++# ---------------------------------------------------------------------------
++
++class SagaOutcome(str, Enum):
++    """Como terminou a saga. O Order traduz isto para a resposta HTTP."""
++
++    CONFIRMED = "CONFIRMED"
++    NOT_ENOUGH_TICKETS = "NOT_ENOUGH_TICKETS"
++    UNKNOWN_EVENT = "UNKNOWN_EVENT"
++    INVENTORY_UNAVAILABLE = "INVENTORY_UNAVAILABLE"
++    PAYMENT_FAILED = "PAYMENT_FAILED"
++    PAYMENT_UNAVAILABLE = "PAYMENT_UNAVAILABLE"
++
++
++@dataclass
++class SagaResult:
++    outcome: SagaOutcome
++    order_status: str  # CONFIRMED, FAILED ou CANCELLED
++    reason: str = ""
++
++
++class PurchaseSaga:
++    """
++    Orquestra a compra: reservar -> cobrar -> confirmar, e libertar os bilhetes se o pagamento falhar.
++
++    conn        ligação ao SQLite do Order (tabelas orders e sagas)
++    inventory   cliente do Inventory, ou None se o Inventory não existir (sem passo de reserva)
++    charge      função que cobra a compra (no Order: o circuit breaker), ou None sem Payment
++    """
++
++    def __init__(self, conn: sqlite3.Connection, inventory: InventoryClient | None, charge: Charge | None,
++                 compensation_attempts: int = 3, compensation_base_seconds: float = 0.1):
++        self.conn = conn
++        self.inventory = inventory
++        self.charge = charge
++        self.compensation_attempts = compensation_attempts
++        self.compensation_base_seconds = compensation_base_seconds
++
++    async def run(self, order) -> SagaResult:
++        """Corre a saga de uma compra já gravada como PENDING. Nunca levanta exceções de negócio."""
++        started = time.perf_counter()
++        start_saga(self.conn, order.id, "RESERVE" if self.inventory else "PAY")
++        SAGA_INITIATED.inc()
++
++        # Passo 1: reservar os bilhetes
++        if self.inventory is not None:
++            try:
++                await self.inventory.reserve(order.id, order.event_id, order.quantity)
++            except NotEnoughTicketsError as exc:
++                return self._abort(order, started, SagaOutcome.NOT_ENOUGH_TICKETS, exc.reason)
++            except UnknownEventError as exc:
++                return self._abort(order, started, SagaOutcome.UNKNOWN_EVENT, exc.reason)
++            except InventoryUnavailableError as exc:
++                # Não se sabe se a reserva ficou feita (a resposta pode ter-se perdido). Como o release é
++                # idempotente, liberta-se por segurança: se não havia reserva, não muda nada.
++                logger.warning("Saga %s: Inventory indisponível na reserva (%s); a libertar por segurança",
++                               order.id, exc.reason)
++                update_saga(self.conn, order.id, reserved=1, step="RELEASE", error=f"reserva: {exc.reason}")
++                return await self._compensate_and_finish(
++                    order, started, SagaOutcome.INVENTORY_UNAVAILABLE, "FAILED", exc.reason)
++            update_saga(self.conn, order.id, reserved=1, step="PAY")
++
++        # Passo 2: cobrar
++        if self.charge is not None:
++            try:
++                await self.charge(order)
++            except PaymentStepError as exc:
++                outcome = (SagaOutcome.PAYMENT_UNAVAILABLE if isinstance(exc, PaymentUnavailableError)
++                           else SagaOutcome.PAYMENT_FAILED)
++                reason = str(exc) or "circuito aberto"
++                if self.inventory is None:
++                    # Sem Inventory não há nada reservado: a saga aborta sem compensação (como na Fase 1)
++                    return self._abort(order, started, outcome, reason)
++                update_saga(self.conn, order.id, step="RELEASE", error=f"pagamento: {reason}")
++                return await self._compensate_and_finish(order, started, outcome, "CANCELLED", reason)
++            update_saga(self.conn, order.id, paid=1, step="CONFIRM")
++
++        # Passo 3: confirmar
++        finish_saga(self.conn, order.id, "SUCCEEDED", "CONFIRMED")
++        SAGA_SUCCESS.inc()
++        SAGA_DURATION.labels(outcome="success").observe(time.perf_counter() - started)
++        return SagaResult(SagaOutcome.CONFIRMED, "CONFIRMED")
++
++    def _abort(self, order, started: float, outcome: SagaOutcome, reason: str) -> SagaResult:
++        """A saga falha sem nada para desfazer."""
++        finish_saga(self.conn, order.id, "ABORTED", "FAILED", error=reason)
++        SAGA_ABORTED.inc()
++        SAGA_DURATION.labels(outcome="aborted").observe(time.perf_counter() - started)
++        logger.info("Saga %s abortada (%s): %s", order.id, outcome.value, reason)
++        return SagaResult(outcome, "FAILED", reason)
++
++    async def _compensate_and_finish(self, order, started: float, outcome: SagaOutcome, order_status: str,
++                                     reason: str) -> SagaResult:
++        """A saga falha depois da reserva: liberta os bilhetes e fecha a saga."""
++        released = await self.release_tickets(order.id, self.compensation_attempts)
++        saga_status = "COMPENSATED" if released is not None else "COMPENSATION_FAILED"
++        finish_saga(self.conn, order.id, saga_status, order_status)
++        SAGA_COMPENSATIONS.labels(outcome="success" if released is not None else "failed").inc()
++        SAGA_ABORTED.inc()
++        SAGA_DURATION.labels(outcome="compensated").observe(time.perf_counter() - started)
++        return SagaResult(outcome, order_status, reason)
++
++    async def release_tickets(self, order_id: str, attempts: int) -> bool | None:
++        """
++        Compensação: POST /inventory/release, com retry e backoff com jitter.
++
++        Devolve True/False (havia ou não uma reserva para libertar) ou None se o Inventory não
++        respondeu em nenhuma tentativa. Nesse caso a saga fica COMPENSATION_FAILED e o Order volta a
++        tentar em segundo plano (retry_failed_compensations).
++        """
++        for attempt in range(1, attempts + 1):
++            try:
++                released = await self.inventory.release(order_id)
++            except InventoryUnavailableError as exc:
++                logger.warning("Saga %s: compensação falhou (tentativa %d de %d): %s",
++                               order_id, attempt, attempts, exc.reason)
++                if attempt < attempts:
++                    await asyncio.sleep(full_jitter_delay(attempt, self.compensation_base_seconds))
++                continue
++            logger.info("Saga %s compensada: bilhetes libertados no Inventory (released=%s)", order_id, released)
++            return released
++        logger.error("Saga %s: compensação falhou em todas as tentativas; fica COMPENSATION_FAILED e o Order "
++                     "volta a tentar em segundo plano", order_id)
++        return None
++
++    def recover_interrupted(self) -> int:
++        """
++        No arranque (antes de aceitar pedidos): fecha as sagas que ficaram a meio porque o Order parou.
++
++        - Já pagou (paid=1): só faltava confirmar, por isso termina para a frente (CONFIRMED).
++        - Ainda não pagou: desfaz para trás. Com Inventory, fica COMPENSATION_FAILED para a libertação
++          ser feita em segundo plano; sem Inventory, não há nada a libertar (ABORTED).
++        Devolve quantas sagas fechou.
++        """
++        rows = self.conn.execute("SELECT * FROM sagas WHERE status = 'RUNNING'").fetchall()
++        for row in rows:
++            order_id = row["order_id"]
++            if row["paid"]:
++                finish_saga(self.conn, order_id, "SUCCEEDED", "CONFIRMED", error="terminada no arranque")
++                logger.warning("Saga %s interrompida depois do pagamento: compra CONFIRMED no arranque", order_id)
++            elif self.inventory is not None:
++                order_status = "CANCELLED" if row["reserved"] else "FAILED"
++                update_saga(self.conn, order_id, reserved=1, step="RELEASE")
++                finish_saga(self.conn, order_id, "COMPENSATION_FAILED", order_status,
++                            error="interrompida: o Order reiniciou a meio")
++                logger.warning("Saga %s interrompida antes do pagamento: compra %s, bilhetes a libertar",
++                               order_id, order_status)
++            else:
++                finish_saga(self.conn, order_id, "ABORTED", "FAILED", error="interrompida: o Order reiniciou a meio")
++                logger.warning("Saga %s interrompida antes do pagamento: compra FAILED", order_id)
++        # Compras PENDING sem saga (o Order parou entre gravar a compra e começar a saga)
++        orphans = self.conn.execute(
++            "UPDATE orders SET status = 'FAILED' WHERE status = 'PENDING' "
++            "AND id NOT IN (SELECT order_id FROM sagas)"
++        ).rowcount
++        return len(rows) + orphans
++
++    async def retry_failed_compensations(self) -> int:
++        """Volta a tentar (uma vez cada) as libertações que falharam. Devolve quantas conseguiu."""
++        if self.inventory is None:
++            return 0
++        rows = self.conn.execute("SELECT order_id FROM sagas WHERE status = 'COMPENSATION_FAILED'").fetchall()
++        done = 0
++        for row in rows:
++            released = await self.release_tickets(row["order_id"], attempts=1)
++            if released is None:
++                continue
++            finish_saga(self.conn, row["order_id"], "COMPENSATED", None)
++            SAGA_COMPENSATIONS.labels(outcome="success").inc()
++            done += 1
++        return done
+diff --git a/order/tests/conftest.py b/order/tests/conftest.py
+index ad920d1..73f3755 100644
+--- a/order/tests/conftest.py
++++ b/order/tests/conftest.py
+@@ -6,6 +6,11 @@ Infraestrutura de testes do Order.
+ - Base de dados: cada teste usa um ficheiro SQLite novo numa pasta temporária.
+ - Payment: um Payment "falso", também numa porta livre, que responde conforme o modo escolhido em
+   cada teste (aceita, falha com 500, demora mais do que o timeout, recusa com 422) e conta os pedidos.
++- Inventory: um Inventory "falso" com stock a sério (reserva atómica, idempotente pelo order_id, e
++  libertação que repõe o stock), mais modos para provocar falhas. Por omissão os testes correm sem
++  Inventory (como na Fase 1); os testes da saga ligam-no com make_client(with_inventory=True).
++- CALL_LOG: lista partilhada onde o Inventory e o Payment falsos registam cada pedido, por ordem,
++  para os testes confirmarem a sequência dos passos da saga.
+ - RabbitMQ: nos testes unitários não há RabbitMQ. A ligação em segundo plano é desligada e a
+   publicação é substituída por uma função que guarda as mensagens numa lista (ou que falha).
+   O teste com um RabbitMQ verdadeiro está em test_rabbitmq_integration.py.
+@@ -32,6 +37,9 @@ EVENTS = {
+ 
+ SLOW_SECONDS = 1.0
+ 
++# Pedidos recebidos pelos serviços falsos, por ordem: ("reserve" | "release" | "payment", order_id)
++CALL_LOG: list[tuple[str, str]] = []
++
+ # Timeout usado nos testes de "serviço em baixo". Tem de ser bem maior do que o tempo que o sistema
+ # operativo demora a recusar a ligação: em Linux é imediato, mas no Windows a ligação a uma porta
+ # fechada só é recusada ao fim de ~2 s (o Windows volta a tentar). Com o timeout normal de 2 s, no
+@@ -98,6 +106,7 @@ class FakePaymentHandler(BaseHTTPRequestHandler):
+         length = int(self.headers.get("Content-Length", 0))
+         body = json.loads(self.rfile.read(length) or b"{}")
+         FakePaymentHandler.requests.append(body)
++        CALL_LOG.append(("payment", body.get("order_id")))
+         mode = FakePaymentHandler.mode
+         if mode == "fail_once":
+             # Falha só este pedido; os seguintes são aceites
+@@ -149,6 +158,115 @@ def payment():
+     FakePaymentHandler.mode = "ok"
+ 
+ 
++# Timeout do Inventory nos testes, e quanto o Inventory falso demora no modo "slow"
++INVENTORY_TEST_TIMEOUT = 0.3
++INVENTORY_SLOW_SECONDS = 0.6
++INITIAL_STOCK = {"evt-101": 100, "evt-104": 3}
++
++
++class FakeInventoryHandler(BaseHTTPRequestHandler):
++    """
++    Simula o Inventory (contrato da secção 8 do plano), com stock em memória.
++
++    reserve_mode:  "ok" (reserva se houver stock), "fail" (500), "slow" (mais do que o timeout)
++    release_mode:  "ok", "fail" (500), "fail_once" (500 no próximo pedido e depois "ok")
++    Um evento fora de `stock` dá 404; stock insuficiente dá 409.
++
++    Um release de uma compra sem reserva fica registado (RELEASED): se a reserva dessa compra chegar
++    depois (o pedido de reserva atrasou-se), é recusada sem descontar. É a regra que o Inventory real
++    tem de seguir para a libertação "por segurança" da saga não deixar bilhetes presos.
++    """
++
++    reserve_mode = "ok"
++    release_mode = "ok"
++    stock: dict[str, int] = {}
++    reservations: dict[str, dict] = {}
++    lock = threading.Lock()
++
++    def do_POST(self):
++        length = int(self.headers.get("Content-Length", 0))
++        body = json.loads(self.rfile.read(length) or b"{}")
++        cls = FakeInventoryHandler
++        if self.path == "/inventory/reserve":
++            CALL_LOG.append(("reserve", body.get("order_id")))
++            if cls.reserve_mode == "fail":
++                return self._send(500, {"detail": "Internal Server Error"})
++            if cls.reserve_mode == "slow":
++                time.sleep(INVENTORY_SLOW_SECONDS)
++            self._reserve(body)
++        elif self.path == "/inventory/release":
++            CALL_LOG.append(("release", body.get("order_id")))
++            if cls.release_mode == "fail_once":
++                cls.release_mode = "ok"
++                return self._send(500, {"detail": "Internal Server Error"})
++            if cls.release_mode == "fail":
++                return self._send(500, {"detail": "Internal Server Error"})
++            self._release(body)
++        else:
++            self._send(404, {"detail": "Not Found"})
++
++    def _reserve(self, body: dict) -> None:
++        cls = FakeInventoryHandler
++        order_id, event_id, quantity = body["order_id"], body["event_id"], int(body["quantity"])
++        with cls.lock:
++            previous = cls.reservations.get(order_id)
++            if previous is not None and previous["status"] == "RELEASED":
++                return self._send(409, {"error": "Order already released"})
++            if previous is not None:  # idempotente: a mesma compra não desconta duas vezes
++                available = cls.stock[event_id]
++            elif event_id not in cls.stock:
++                return self._send(404, {"detail": f"Evento '{event_id}' sem stock definido"})
++            elif cls.stock[event_id] < quantity:
++                return self._send(409, {"error": "Not enough tickets"})
++            else:
++                cls.stock[event_id] -= quantity
++                cls.reservations[order_id] = {"event_id": event_id, "quantity": quantity, "status": "RESERVED"}
++                available = cls.stock[event_id]
++        self._send(200, {"order_id": order_id, "event_id": event_id, "quantity": quantity,
++                         "available_tickets": available})
++
++    def _release(self, body: dict) -> None:
++        cls = FakeInventoryHandler
++        with cls.lock:
++            reservation = cls.reservations.get(body["order_id"])
++            if reservation is None:
++                # Ainda não há reserva: fica registado, para uma reserva atrasada ser recusada
++                cls.reservations[body["order_id"]] = {"event_id": None, "quantity": 0, "status": "RELEASED"}
++                return self._send(200, {"released": False})
++            if reservation["status"] == "RELEASED":
++                return self._send(200, {"released": False})
++            reservation["status"] = "RELEASED"
++            cls.stock[reservation["event_id"]] += reservation["quantity"]
++        self._send(200, {"released": True})
++
++    _send = FakePaymentHandler._send
++
++    def log_message(self, *args):
++        pass
++
++
++@pytest.fixture(scope="session")
++def fake_inventory_url():
++    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeInventoryHandler)
++    server.daemon_threads = True
++    threading.Thread(target=server.serve_forever, daemon=True).start()
++    yield f"http://127.0.0.1:{server.server_address[1]}"
++    server.shutdown()
++
++
++@pytest.fixture
++def inventory():
++    """O Inventory falso, a começar cada teste com o stock inicial, sem reservas e nos modos "ok"."""
++    FakeInventoryHandler.reserve_mode = "ok"
++    FakeInventoryHandler.release_mode = "ok"
++    FakeInventoryHandler.stock = dict(INITIAL_STOCK)
++    FakeInventoryHandler.reservations = {}
++    CALL_LOG.clear()
++    yield FakeInventoryHandler
++    FakeInventoryHandler.reserve_mode = "ok"
++    FakeInventoryHandler.release_mode = "ok"
++
++
+ def unused_port() -> int:
+     with socket.socket() as s:
+         s.bind(("127.0.0.1", 0))
+@@ -168,7 +286,8 @@ def published():
+ 
+ 
+ @pytest.fixture
+-def make_client(monkeypatch, tmp_path, fake_catalog_url, fake_payment_url, payment, published):
++def make_client(monkeypatch, tmp_path, fake_catalog_url, fake_payment_url, payment, published,
++                fake_inventory_url, inventory):
+     """
+     Cria um TestClient do Order.
+ 
+@@ -176,13 +295,18 @@ def make_client(monkeypatch, tmp_path, fake_catalog_url, fake_payment_url, payme
+     rabbitmq="down": sem ligação ao RabbitMQ (a função de publicação verdadeira falha)
+     payment_url:     por omissão o Payment falso; "" desliga o passo do pagamento
+     attempts, failure_threshold, open_seconds: configuração do retry e do circuit breaker
++    with_inventory:  liga o passo de reserva ao Inventory falso (por omissão, sem Inventory)
++    inventory_url:   outro endereço para o Inventory (ex.: uma porta em baixo); implica with_inventory
++    recovery_seconds: intervalo da recuperação das compensações em segundo plano (0 = desligada)
+     """
+ 
+     @contextmanager
+     def _make(catalog_url: str | None = None, rabbitmq: str = "ok", catalog_timeout: float = 2.0,
+               db_path=None, payment_url: str | None = None, attempts: int = 3, failure_threshold: int = 5,
+               open_seconds: float = 30.0, half_open_max_calls: int = 1,
+-              payment_timeout: float = PAYMENT_TEST_TIMEOUT):
++              payment_timeout: float = PAYMENT_TEST_TIMEOUT, with_inventory: bool = False,
++              inventory_url: str | None = None, compensation_attempts: int = 3, recovery_seconds: float = 0.0,
++              inventory_timeout: float = INVENTORY_TEST_TIMEOUT):
+         monkeypatch.setattr(main, "CATALOG_URL", catalog_url or fake_catalog_url)
+         monkeypatch.setattr(main, "CATALOG_TIMEOUT_SECONDS", catalog_timeout)
+         monkeypatch.setattr(main, "ORDERS_DB_PATH", db_path or tmp_path / "orders.db")
+@@ -193,6 +317,14 @@ def make_client(monkeypatch, tmp_path, fake_catalog_url, fake_payment_url, payme
+         monkeypatch.setattr(main, "CB_FAILURE_THRESHOLD", failure_threshold)
+         monkeypatch.setattr(main, "CB_OPEN_SECONDS", open_seconds)
+         monkeypatch.setattr(main, "CB_HALF_OPEN_MAX_CALLS", half_open_max_calls)
++        if inventory_url is None:
++            inventory_url = fake_inventory_url if with_inventory else ""
++        monkeypatch.setattr(main, "INVENTORY_URL", inventory_url)
++        monkeypatch.setattr(main, "INVENTORY_TIMEOUT_SECONDS", inventory_timeout)
++        monkeypatch.setattr(main, "COMPENSATION_RETRY_ATTEMPTS", compensation_attempts)
++        monkeypatch.setattr(main, "COMPENSATION_RETRY_BASE_SECONDS", 0.01)
++        monkeypatch.setattr(main, "SAGA_RECOVERY_SECONDS", recovery_seconds)
++        monkeypatch.setattr(main, "SQLITE_JOURNAL_MODE", "WAL")
+ 
+         async def no_rabbitmq_connection(app):
+             return None
+diff --git a/order/tests/test_main.py b/order/tests/test_main.py
+index a723c45..b51c36d 100644
+--- a/order/tests/test_main.py
++++ b/order/tests/test_main.py
+@@ -157,7 +157,8 @@ def test_health_does_not_depend_on_rabbitmq(make_client):
+         response = client.get("/health")
+ 
+     assert response.status_code == 200
+-    assert response.json() == {"status": "ok", "rabbitmq": "disconnected", "payment": "CLOSED"}
++    assert response.json() == {"status": "ok", "rabbitmq": "disconnected", "payment": "CLOSED",
++                               "inventory": "disabled"}
+ 
+ 
+ def test_health_shows_when_payment_is_disabled(make_client):
+diff --git a/order/tests/test_saga.py b/order/tests/test_saga.py
+new file mode 100644
+index 0000000..ae8308c
+--- /dev/null
++++ b/order/tests/test_saga.py
+@@ -0,0 +1,393 @@
++"""
++Testes da Saga orquestrada (saga.py): reservar no Inventory -> cobrar no Payment -> confirmar,
++e libertar os bilhetes (compensação) quando o pagamento falha.
++
++O Inventory e o Payment são os falsos do conftest.py. O Inventory falso tem stock a sério, por isso
++os testes confirmam também que o stock volta ao valor inicial depois de uma compensação.
++"""
++
++import sqlite3
++import time
++
++import pytest
++from prometheus_client import REGISTRY
++
++import main
++import saga
++from conftest import CALL_LOG, INITIAL_STOCK, VALID_ORDER
++
++PAYMENT_UNAVAILABLE = {"error": "Payment system unavailable, try again later"}
++
++
++def metric(name: str, labels: dict | None = None) -> float:
++    return REGISTRY.get_sample_value(name, labels or {}) or 0.0
++
++
++class Metrics:
++    """Fotografia das métricas da saga, para comparar antes e depois de cada teste."""
++
++    NAMES = {
++        "initiated": ("saga_transactions_initiated_total", None),
++        "success": ("saga_transactions_success_total", None),
++        "aborted": ("saga_transactions_aborted_total", None),
++        "comp_success": ("saga_compensations_executed_total", {"outcome": "success"}),
++        "comp_failed": ("saga_compensations_executed_total", {"outcome": "failed"}),
++        "dur_success": ("saga_duration_seconds_count", {"outcome": "success"}),
++        "dur_compensated": ("saga_duration_seconds_count", {"outcome": "compensated"}),
++        "dur_aborted": ("saga_duration_seconds_count", {"outcome": "aborted"}),
++        "confirmed": ("orders_initiated_total", {"status": "CONFIRMED"}),
++        "cancelled": ("orders_initiated_total", {"status": "CANCELLED"}),
++        "failed": ("orders_initiated_total", {"status": "FAILED"}),
++    }
++
++    def __init__(self):
++        self.values = {key: metric(*spec) for key, spec in self.NAMES.items()}
++
++    def delta(self) -> dict:
++        """O que mudou desde a fotografia (só as métricas que mudaram)."""
++        now = Metrics().values
++        return {key: now[key] - self.values[key] for key in now if now[key] != self.values[key]}
++
++
++def db_row(table: str, key: str, value: str) -> dict:
++    """Lê uma linha com uma ligação nova (a do Order pertence a outra thread)."""
++    with sqlite3.connect(main.ORDERS_DB_PATH) as conn:
++        conn.row_factory = sqlite3.Row
++        row = conn.execute(f"SELECT * FROM {table} WHERE {key} = ?", (value,)).fetchone()
++        return dict(row) if row else None
++
++
++def steps(order_id: str) -> list[str]:
++    """Os pedidos que a compra fez aos serviços falsos, por ordem."""
++    return [step for step, oid in CALL_LOG if oid == order_id]
++
++
++def last_order_id() -> str:
++    """Id da última compra gravada (as respostas de erro do circuito aberto não trazem o id)."""
++    with sqlite3.connect(main.ORDERS_DB_PATH) as conn:
++        return conn.execute("SELECT id FROM orders ORDER BY rowid DESC LIMIT 1").fetchone()[0]
++
++
++# --- Caminho feliz -----------------------------------------------------------
++
++def test_successful_saga_reserves_then_pays_then_confirms(make_client, inventory, payment, published):
++    before = Metrics()
++    with make_client(with_inventory=True) as client:
++        response = client.post("/orders", json=VALID_ORDER)
++
++    assert response.status_code == 201
++    order = response.json()
++    assert order["status"] == "CONFIRMED"
++    assert steps(order["id"]) == ["reserve", "payment"]  # reservar antes de cobrar, sem libertar
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"] - VALID_ORDER["quantity"]
++    assert [o.id for o in published] == [order["id"]]  # só depois de CONFIRMED
++
++    saga_row = db_row("sagas", "order_id", order["id"])
++    assert saga_row["status"] == "SUCCEEDED"
++    assert (saga_row["reserved"], saga_row["paid"], saga_row["step"]) == (1, 1, "DONE")
++    assert saga_row["finished_at"] is not None
++    assert before.delta() == {"initiated": 1, "success": 1, "dur_success": 1, "confirmed": 1}
++
++
++def test_reserve_request_carries_the_order(make_client, inventory, payment):
++    with make_client(with_inventory=True) as client:
++        order = client.post("/orders", json={**VALID_ORDER, "quantity": 3}).json()
++
++    assert inventory.reservations[order["id"]] == {"event_id": "evt-101", "quantity": 3, "status": "RESERVED"}
++
++
++# --- Falhas na reserva: nada a compensar -------------------------------------
++
++def test_not_enough_tickets_fails_with_409_without_charging(make_client, inventory, payment, published):
++    inventory.stock["evt-104"] = 1
++    before = Metrics()
++    with make_client(with_inventory=True) as client:
++        response = client.post("/orders", json={**VALID_ORDER, "event_id": "evt-104", "quantity": 2})
++
++    assert response.status_code == 409
++    body = response.json()
++    assert body["error"] == "Not enough tickets"
++    assert db_row("orders", "id", body["order_id"])["status"] == "FAILED"
++    assert db_row("sagas", "order_id", body["order_id"])["status"] == "ABORTED"
++    assert steps(body["order_id"]) == ["reserve"]  # nem cobra nem liberta
++    assert payment.requests == [] and published == []
++    assert before.delta() == {"initiated": 1, "aborted": 1, "dur_aborted": 1, "failed": 1}
++
++
++def test_event_without_stock_in_inventory_returns_422(make_client, inventory, payment):
++    del inventory.stock["evt-104"]
++    with make_client(with_inventory=True) as client:
++        response = client.post("/orders", json={**VALID_ORDER, "event_id": "evt-104"})
++
++    assert response.status_code == 422
++    order_id = response.json()["order_id"]
++    assert db_row("orders", "id", order_id)["status"] == "FAILED"
++    assert steps(order_id) == ["reserve"]
++
++
++def test_last_tickets_go_to_exactly_one_buyer(make_client, inventory, payment):
++    inventory.stock["evt-104"] = 2
++    with make_client(with_inventory=True) as client:
++        codes = [client.post("/orders", json={**VALID_ORDER, "event_id": "evt-104", "quantity": 1}).status_code
++                 for _ in range(4)]
++        stats = client.get("/orders/stats").json()
++
++    assert codes == [201, 201, 409, 409]
++    assert inventory.stock["evt-104"] == 0
++    assert stats["orders"]["CONFIRMED"] == 2 and stats["orders"]["FAILED"] == 2
++
++
++def test_inventory_error_fails_with_503_and_releases_just_in_case(make_client, inventory, payment):
++    inventory.reserve_mode = "fail"
++    before = Metrics()
++    with make_client(with_inventory=True) as client:
++        response = client.post("/orders", json=VALID_ORDER)
++
++    assert response.status_code == 503
++    body = response.json()
++    assert body["error"] == "Inventory unavailable, try again later"
++    assert db_row("orders", "id", body["order_id"])["status"] == "FAILED"
++    # Não se sabe se a reserva ficou feita: liberta por segurança (o release é idempotente) e não cobra
++    assert steps(body["order_id"]) == ["reserve", "release"]
++    assert payment.requests == []
++    assert db_row("sagas", "order_id", body["order_id"])["status"] == "COMPENSATED"
++    assert before.delta() == {"initiated": 1, "aborted": 1, "comp_success": 1, "dur_compensated": 1, "failed": 1}
++
++
++def test_inventory_timeout_does_not_leave_tickets_reserved(make_client, inventory, payment):
++    # A reserva demora mais do que o timeout: o Order desiste e liberta por segurança. O release chega
++    # ao Inventory antes da reserva atrasada, e por isso a reserva atrasada é recusada (regra do contrato).
++    inventory.reserve_mode = "slow"
++    with make_client(with_inventory=True) as client:
++        response = client.post("/orders", json=VALID_ORDER)
++        time.sleep(0.6)  # deixar o Inventory falso acabar a reserva lenta
++
++    assert response.status_code == 503
++    order_id = response.json()["order_id"]
++    assert steps(order_id) == ["reserve", "release"]
++    assert payment.requests == []
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"]  # nenhum bilhete ficou preso
++
++
++def test_inventory_down_returns_503(make_client, inventory, payment, unused_url):
++    with make_client(inventory_url=unused_url, compensation_attempts=1, inventory_timeout=10.0) as client:
++        response = client.post("/orders", json=VALID_ORDER)
++
++    assert response.status_code == 503
++    order_id = response.json()["order_id"]
++    assert db_row("orders", "id", order_id)["status"] == "FAILED"
++    assert payment.requests == []
++
++
++# --- Falhas no pagamento: compensação ----------------------------------------
++
++def test_failed_payment_releases_the_tickets_and_cancels(make_client, inventory, payment, published):
++    payment.mode = "fail"
++    before = Metrics()
++    with make_client(with_inventory=True, attempts=2) as client:
++        response = client.post("/orders", json=VALID_ORDER)
++
++    assert response.status_code == 502
++    body = response.json()
++    assert body["error"] == "Payment failed"
++    order_id = body["order_id"]
++    assert db_row("orders", "id", order_id)["status"] == "CANCELLED"
++    assert steps(order_id) == ["reserve", "payment", "payment", "release"]  # o release exatamente uma vez
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"]  # o stock voltou
++    assert inventory.reservations[order_id]["status"] == "RELEASED"
++    assert published == []
++    saga_row = db_row("sagas", "order_id", order_id)
++    assert (saga_row["status"], saga_row["reserved"], saga_row["paid"]) == ("COMPENSATED", 1, 0)
++    assert saga_row["error"].startswith("pagamento:")
++    assert before.delta() == {"initiated": 1, "aborted": 1, "comp_success": 1, "dur_compensated": 1,
++                              "cancelled": 1}
++
++
++def test_open_circuit_cancels_with_the_exact_503_and_releases(make_client, inventory, payment):
++    payment.mode = "fail"
++    with make_client(with_inventory=True, attempts=1, failure_threshold=1) as client:
++        client.post("/orders", json=VALID_ORDER)  # abre o circuito
++        payment.requests.clear()
++        before = Metrics()
++        response = client.post("/orders", json=VALID_ORDER)
++
++    assert response.status_code == 503
++    assert response.json() == PAYMENT_UNAVAILABLE
++    order_id = last_order_id()
++    assert steps(order_id) == ["reserve", "release"]  # o Payment nem foi chamado
++    assert payment.requests == []
++    assert db_row("orders", "id", order_id)["status"] == "CANCELLED"
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"]
++    assert before.delta() == {"initiated": 1, "aborted": 1, "comp_success": 1, "dur_compensated": 1,
++                              "cancelled": 1}
++
++
++def test_compensation_is_retried_when_the_release_fails_once(make_client, inventory, payment):
++    payment.mode = "fail"
++    inventory.release_mode = "fail_once"
++    with make_client(with_inventory=True, attempts=1) as client:
++        order_id = client.post("/orders", json=VALID_ORDER).json()["order_id"]
++
++    assert steps(order_id) == ["reserve", "payment", "release", "release"]
++    assert db_row("sagas", "order_id", order_id)["status"] == "COMPENSATED"
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"]
++
++
++def test_failed_compensation_is_retried_in_the_background(make_client, inventory, payment):
++    payment.mode = "fail"
++    inventory.release_mode = "fail"
++    before = Metrics()
++    with make_client(with_inventory=True, attempts=1, compensation_attempts=2, recovery_seconds=0.1) as client:
++        response = client.post("/orders", json=VALID_ORDER)
++        order_id = response.json()["order_id"]
++
++        # As tentativas da compensação falharam: a compra fica CANCELLED (não foi cobrada), mas os
++        # bilhetes continuam reservados e a saga fica pendente
++        assert response.status_code == 502
++        assert db_row("sagas", "order_id", order_id)["status"] == "COMPENSATION_FAILED"
++        assert db_row("orders", "id", order_id)["status"] == "CANCELLED"
++        assert client.get("/orders/stats").json()["sagas"]["COMPENSATION_FAILED"] == 1
++
++        # O Inventory volta: a recuperação em segundo plano liberta os bilhetes
++        inventory.release_mode = "ok"
++        deadline = time.monotonic() + 3
++        while db_row("sagas", "order_id", order_id)["status"] != "COMPENSATED" and time.monotonic() < deadline:
++            time.sleep(0.05)
++
++    assert db_row("sagas", "order_id", order_id)["status"] == "COMPENSATED"
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"]
++    assert before.delta()["comp_failed"] == 1
++    assert before.delta()["comp_success"] == 1
++
++
++# --- Recuperação no arranque -------------------------------------------------
++
++def seed_interrupted(db_path, order_id: str, step: str, reserved: int, paid: int) -> None:
++    """Simula uma saga que ficou a meio: compra PENDING e saga RUNNING, como se o Order tivesse caído."""
++    conn = main.open_database(db_path)
++    conn.execute(
++        "INSERT INTO orders VALUES (?, 'c', 'a@b.pt', 'evt-101', 2, 170.0, 'PENDING', '2026-11-25T10:00:00+00:00')",
++        (order_id,),
++    )
++    conn.execute(
++        "INSERT INTO sagas (order_id, status, step, reserved, paid, started_at) VALUES (?, 'RUNNING', ?, ?, ?, ?)",
++        (order_id, step, reserved, paid, "2026-11-25T10:00:00+00:00"),
++    )
++    conn.close()
++
++
++def test_interrupted_saga_after_payment_is_confirmed_on_startup(make_client, inventory, tmp_path):
++    db_path = tmp_path / "orders.db"
++    seed_interrupted(db_path, "ord-pago", step="CONFIRM", reserved=1, paid=1)
++
++    with make_client(with_inventory=True, db_path=db_path) as client:
++        status = client.get("/orders/ord-pago").json()["status"]
++
++    assert status == "CONFIRMED"
++    assert db_row("sagas", "order_id", "ord-pago")["status"] == "SUCCEEDED"
++    assert steps("ord-pago") == []  # já estava pago: não liberta nada
++
++
++def test_interrupted_saga_before_payment_releases_the_tickets(make_client, inventory, tmp_path):
++    db_path = tmp_path / "orders.db"
++    inventory.stock["evt-101"] -= 2
++    inventory.reservations["ord-meio"] = {"event_id": "evt-101", "quantity": 2, "status": "RESERVED"}
++    seed_interrupted(db_path, "ord-meio", step="PAY", reserved=1, paid=0)
++
++    with make_client(with_inventory=True, db_path=db_path, recovery_seconds=0.05) as client:
++        assert client.get("/orders/ord-meio").json()["status"] == "CANCELLED"
++        deadline = time.monotonic() + 3
++        while db_row("sagas", "order_id", "ord-meio")["status"] != "COMPENSATED" and time.monotonic() < deadline:
++            time.sleep(0.05)
++
++    assert db_row("sagas", "order_id", "ord-meio")["status"] == "COMPENSATED"
++    assert steps("ord-meio") == ["release"]
++    assert inventory.stock["evt-101"] == INITIAL_STOCK["evt-101"]
++
++
++def test_interrupted_saga_without_inventory_just_fails(make_client, tmp_path):
++    db_path = tmp_path / "orders.db"
++    seed_interrupted(db_path, "ord-sem-inv", step="PAY", reserved=0, paid=0)
++
++    with make_client(db_path=db_path) as client:
++        assert client.get("/orders/ord-sem-inv").json()["status"] == "FAILED"
++
++    assert db_row("sagas", "order_id", "ord-sem-inv")["status"] == "ABORTED"
++
++
++def test_pending_order_without_saga_fails_on_startup(make_client, tmp_path):
++    db_path = tmp_path / "orders.db"
++    conn = main.open_database(db_path)
++    conn.execute("INSERT INTO orders VALUES ('ord-orfa', 'c', 'a@b.pt', 'evt-101', 1, 85.0, 'PENDING', 'x')")
++    conn.close()
++
++    with make_client(db_path=db_path) as client:
++        assert client.get("/orders/ord-orfa").json()["status"] == "FAILED"
++
++
++# --- Sem Inventory (Fase 1) --------------------------------------------------
++
++def test_without_inventory_the_saga_is_payment_then_confirm(make_client, payment, inventory):
++    before = Metrics()
++    with make_client() as client:
++        assert client.get("/health").json()["inventory"] == "disabled"
++        response = client.post("/orders", json=VALID_ORDER)
++
++    assert response.status_code == 201
++    assert steps(response.json()["id"]) == ["payment"]
++    assert before.delta() == {"initiated": 1, "success": 1, "dur_success": 1, "confirmed": 1}
++
++
++def test_without_inventory_a_failed_payment_is_failed_not_cancelled(make_client, payment, inventory):
++    payment.mode = "fail"
++    with make_client(attempts=1) as client:
++        order_id = client.post("/orders", json=VALID_ORDER).json()["order_id"]
++
++    assert db_row("orders", "id", order_id)["status"] == "FAILED"
++    assert db_row("sagas", "order_id", order_id)["status"] == "ABORTED"
++    assert "release" not in steps(order_id)
++
++
++# --- Endpoints e métricas ----------------------------------------------------
++
++def test_stats_count_orders_and_sagas_by_status(make_client, inventory, payment):
++    inventory.stock["evt-104"] = 1
++    with make_client(with_inventory=True, attempts=1) as client:
++        client.post("/orders", json=VALID_ORDER)                                    # CONFIRMED
++        client.post("/orders", json={**VALID_ORDER, "event_id": "evt-104", "quantity": 2})  # FAILED (409)
++        payment.mode = "fail"
++        client.post("/orders", json=VALID_ORDER)                                    # CANCELLED
++        stats = client.get("/orders/stats").json()
++
++    assert stats == {
++        "orders": {"PENDING": 0, "CONFIRMED": 1, "CANCELLED": 1, "FAILED": 1},
++        "sagas": {"RUNNING": 0, "SUCCEEDED": 1, "ABORTED": 1, "COMPENSATED": 1, "COMPENSATION_FAILED": 0},
++    }
++
++
++def test_health_shows_inventory_enabled(make_client, inventory):
++    with make_client(with_inventory=True) as client:
++        assert client.get("/health").json()["inventory"] == "enabled"
++
++
++def test_saga_metrics_are_exposed_with_the_names_of_the_assignment(client):
++    text = client.get("/metrics").text
++    for name in ("saga_transactions_initiated_total", "saga_transactions_success_total",
++                 "saga_transactions_aborted_total", 'saga_compensations_executed_total{outcome="success"}',
++                 'saga_compensations_executed_total{outcome="failed"}', 'saga_duration_seconds_bucket{le="0.1",outcome="success"}',
++                 'orders_initiated_total{status="CANCELLED"}'):
++        assert name in text, name
++
++
++@pytest.mark.parametrize("mode", ["WAL", "DELETE"])
++def test_database_opens_in_both_journal_modes(tmp_path, mode):
++    conn = main.open_database(tmp_path / "orders.db", mode)
++    assert conn.execute("PRAGMA journal_mode").fetchone()[0].upper() == mode
++    assert {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")} >= {"orders", "sagas"}
++    conn.close()
++
++
++def test_count_sagas_lists_every_status(tmp_path):
++    conn = main.open_database(tmp_path / "orders.db")
++    assert saga.count_sagas(conn) == dict.fromkeys(saga.SAGA_STATUSES, 0)
++    conn.close()

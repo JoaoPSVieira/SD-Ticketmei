@@ -114,6 +114,10 @@ services:
       # Vazio = sem pagamento (compras confirmadas sem cobrar). Para ver o circuito abrir com um Payment
       # inexistente: PAYMENT_URL=http://naoexiste:8004 docker compose up -d order
       - PAYMENT_URL=${PAYMENT_URL-http://payment:8004}
+      # Saga (Parte II, Fase 2): cada compra reserva os bilhetes no Inventory antes de cobrar. Vazio
+      # enquanto o Inventory não estiver no compose. Quando entrar: INVENTORY_URL=http://inventory:8005
+      # (ou só ${INVENTORY_URL-http://inventory:8005}) e o depends_on do inventory.
+      - INVENTORY_URL=${INVENTORY_URL-}
       - PAYMENT_TIMEOUT_SECONDS=1
       - PAYMENT_RETRY_ATTEMPTS=3
       - PAYMENT_RETRY_BASE_SECONDS=0.1

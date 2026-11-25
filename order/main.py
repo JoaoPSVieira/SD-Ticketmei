@@ -1,17 +1,19 @@
 """
 TicketMEI - serviço Order
 
-Recebe os pedidos de compra de bilhetes, regista cada compra numa base de dados própria (SQLite),
-cobra a compra no serviço Payment e, se o pagamento correr bem, confirma-a e publica a mensagem
-"OrderCreated" no RabbitMQ, para o serviço Notification enviar o email de confirmação.
+Recebe os pedidos de compra de bilhetes e regista cada compra numa base de dados própria (SQLite).
+Cada compra é uma Saga orquestrada pelo Order (saga.py): reserva os bilhetes no Inventory, cobra no
+Payment e confirma; se o pagamento falhar, liberta os bilhetes (compensação). Uma compra confirmada
+gera a mensagem "OrderCreated" no RabbitMQ, para o serviço Notification enviar o email.
 
 As chamadas ao Payment passam por um circuit breaker com retry e jitter (circuit_breaker.py): se o
 Payment estiver a falhar ou lento, o circuito abre e o Order responde logo 503, sem chamar o Payment.
 
 Endpoints:
-    POST /orders         -> cria e cobra uma compra -> 201 CONFIRMED, 502 ou 503 (FAILED)
+    POST /orders         -> cria uma compra (Saga) -> 201 CONFIRMED, 409/422/503 (FAILED) ou 502/503 (CANCELLED)
+    GET  /orders/stats   -> contagens das compras e das sagas por estado (validação dos testes k6)
     GET  /orders/{id}    -> detalhes de uma compra (404 se não existir)
-    GET  /health         -> estado do serviço (não depende do RabbitMQ, do Catalog nem do Payment)
+    GET  /health         -> estado do serviço (não depende do RabbitMQ, do Catalog, do Inventory nem do Payment)
     GET  /metrics        -> métricas no formato Prometheus
 
 Fluxo de POST /orders:
@@ -19,19 +21,25 @@ Fluxo de POST /orders:
     2. Pergunta ao Catalog o preço do evento (pedido síncrono)            -> 422 se o evento não existe,
                                                                              502/504 se o Catalog falhar
     3. Grava a compra como PENDING no SQLite
-    4. Cobra no Payment (POST /payments), pelo circuit breaker e com retry:
-         - pagamento aceite                -> CONFIRMED, segue para o passo 5
-         - circuito aberto                 -> FAILED, 503 {"error": "Payment system unavailable, try again later"}
-         - falhou em todas as tentativas   -> FAILED, 502 {"error": "Payment failed", ...}
+    4. Saga (saga.py):
+         a. Reserva no Inventory (POST /inventory/reserve)
+              - sem bilhetes                 -> FAILED, 409 {"error": "Not enough tickets"}
+              - evento sem stock             -> FAILED, 422
+              - Inventory indisponível       -> FAILED, 503 (liberta por segurança)
+         b. Cobra no Payment (POST /payments), pelo circuit breaker e com retry:
+              - circuito aberto              -> liberta os bilhetes, CANCELLED, 503 {"error": "Payment system unavailable, try again later"}
+              - falhou em todas as tentativas -> liberta os bilhetes, CANCELLED, 502 {"error": "Payment failed", ...}
+         c. Confirma                         -> CONFIRMED
     5. Publica OrderCreated na exchange orders.exchange do RabbitMQ         -> 201 Created
        Se a publicação falhar, a compra continua CONFIRMED (já foi paga): o email não é enviado e a
        falha fica registada no log e na métrica order_publish_failures_total.
 
-    Enquanto o Payment não existir no cluster, PAYMENT_URL fica vazio e o passo 4 não acontece: a
-    compra é confirmada logo a seguir a ser gravada.
+    INVENTORY_URL ou PAYMENT_URL vazios desligam o passo respetivo. Sem Inventory não há nada a
+    libertar, por isso um pagamento falhado deixa a compra FAILED (como na Fase 1).
 
 Métricas:
-    orders_initiated_total            Counter    labels: status (CONFIRMED, FAILED)
+    orders_initiated_total            Counter    labels: status (CONFIRMED, CANCELLED, FAILED)
+    saga_transactions_*_total, saga_compensations_executed_total, saga_duration_seconds   (ver saga.py)
     circuit_breaker_state             Gauge      0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN
     circuit_breaker_fallbacks_total   Counter    tentativas recusadas pelo circuito (sem chamar o Payment)
     payment_client_requests_total     Counter    labels: status (2xx, 500, timeout, error, ...)
@@ -72,7 +80,9 @@ from prometheus_client import (
 )
 from pydantic import BaseModel, Field
 
+import saga
 from circuit_breaker import CircuitBreaker, State, full_jitter_delay
+from saga import InventoryClient, PaymentFailedError, PaymentUnavailableError, PurchaseSaga, SagaOutcome
 
 # ---------------------------------------------------------------------------
 # Configuração (variáveis de ambiente)
@@ -99,6 +109,16 @@ PAYMENT_TIMEOUT_SECONDS = float(os.getenv("PAYMENT_TIMEOUT_SECONDS", "1"))
 PAYMENT_RETRY_ATTEMPTS = int(os.getenv("PAYMENT_RETRY_ATTEMPTS", "3"))
 PAYMENT_RETRY_BASE_SECONDS = float(os.getenv("PAYMENT_RETRY_BASE_SECONDS", "0.1"))
 
+# Serviço Inventory (Parte II, Fase 2). Vazio: sem passo de reserva (enquanto o Inventory não existir).
+INVENTORY_URL = os.getenv("INVENTORY_URL", "").rstrip("/")
+INVENTORY_TIMEOUT_SECONDS = float(os.getenv("INVENTORY_TIMEOUT_SECONDS", "1"))
+
+# Saga: tentativas da compensação (libertar os bilhetes) e de quanto em quanto tempo o Order volta a
+# tentar, em segundo plano, as compensações que falharam (0 desliga)
+COMPENSATION_RETRY_ATTEMPTS = int(os.getenv("COMPENSATION_RETRY_ATTEMPTS", "3"))
+COMPENSATION_RETRY_BASE_SECONDS = float(os.getenv("COMPENSATION_RETRY_BASE_SECONDS", "0.1"))
+SAGA_RECOVERY_SECONDS = float(os.getenv("SAGA_RECOVERY_SECONDS", "10"))
+
 # Circuit breaker: abre com N falhas seguidas, fica aberto X segundos, depois deixa passar M chamadas de teste
 CB_FAILURE_THRESHOLD = int(os.getenv("CB_FAILURE_THRESHOLD", "5"))
 CB_OPEN_SECONDS = float(os.getenv("CB_OPEN_SECONDS", "15"))
@@ -116,12 +136,16 @@ RABBITMQ_RETRY_SECONDS = float(os.getenv("RABBITMQ_RETRY_SECONDS", "2"))
 
 # Base de dados do Order: um ficheiro SQLite (no contentor fica num volume do Docker)
 ORDERS_DB_PATH = Path(os.getenv("ORDERS_DB_PATH", Path(__file__).parent / "data" / "orders.db"))
+# WAL no cluster local; DELETE no cluster global, porque o disco é NFS e o WAL não funciona bem em discos de rede
+SQLITE_JOURNAL_MODE = os.getenv("SQLITE_JOURNAL_MODE", "WAL").upper()
 
 # RF2: limite de bilhetes por compra
 MAX_TICKETS_PER_ORDER = int(os.getenv("MAX_TICKETS_PER_ORDER", "4"))
 
 # Resposta do enunciado quando o circuito está aberto
 PAYMENT_UNAVAILABLE = {"error": "Payment system unavailable, try again later"}
+NOT_ENOUGH_TICKETS = {"error": "Not enough tickets"}
+INVENTORY_UNAVAILABLE = {"error": "Inventory unavailable, try again later"}
 
 
 def rabbitmq_url() -> str:
@@ -186,22 +210,24 @@ CREATE TABLE IF NOT EXISTS orders (
 """
 
 
-def open_database(path: Path) -> sqlite3.Connection:
+def open_database(path: Path, journal_mode: str = "WAL") -> sqlite3.Connection:
     """
     Abre (e cria, se ainda não existir) a base de dados.
 
     - WAL (Write-Ahead Logging): vários processos podem ler enquanto outro escreve, e as escritas
-      de processos diferentes ficam em fila em vez de falharem.
+      de processos diferentes ficam em fila em vez de falharem. synchronous=NORMAL é seguro em WAL.
+    - Em discos de rede (NFS, no cluster global) usa-se SQLITE_JOURNAL_MODE=DELETE, o modo clássico,
+      com synchronous=FULL (o valor seguro fora do WAL).
     - busy_timeout: se outro processo estiver a escrever, espera até 5 s em vez de dar erro.
-    - synchronous=NORMAL: seguro em modo WAL e muito mais rápido do que o valor por omissão.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5, isolation_level=None)  # isolation_level=None: cada comando é gravado logo
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA journal_mode={journal_mode}")
+    conn.execute("PRAGMA synchronous=NORMAL" if journal_mode == "WAL" else "PRAGMA synchronous=FULL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(SCHEMA)
+    conn.execute(saga.SAGA_SCHEMA)
     return conn
 
 
@@ -211,10 +237,6 @@ def insert_order(conn: sqlite3.Connection, order: Order) -> None:
         " VALUES (:id, :customer_id, :customer_email, :event_id, :quantity, :total_amount, :status, :created_at)",
         order.model_dump(),
     )
-
-
-def update_status(conn: sqlite3.Connection, order_id: str, status: str) -> None:
-    conn.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
 
 
 def find_order(conn: sqlite3.Connection, order_id: str) -> Order | None:
@@ -228,11 +250,12 @@ def find_order(conn: sqlite3.Connection, order_id: str) -> Order | None:
 
 ORDERS_INITIATED = Counter(
     "orders_initiated_total",
-    "Compras iniciadas, por estado em que ficaram (CONFIRMED: paga e confirmada; FAILED: pagamento falhou)",
+    "Compras iniciadas, por estado em que ficaram (CONFIRMED: paga e confirmada; CANCELLED: o pagamento falhou "
+    "e os bilhetes foram libertados; FAILED: falhou sem nada reservado)",
     ["status"],
 )
 # Cria as séries a zero logo no arranque, para os gráficos mostrarem 0 em vez de "No data"
-for _status in ("CONFIRMED", "FAILED"):
+for _status in ("CONFIRMED", "CANCELLED", "FAILED"):
     ORDERS_INITIATED.labels(status=_status)
 
 CIRCUIT_BREAKER_STATE = Gauge(
@@ -436,12 +459,12 @@ async def fetch_event_price(app: FastAPI, event_id: str) -> float:
 # Payment (circuit breaker e retry com jitter)
 # ---------------------------------------------------------------------------
 
-class CircuitOpenError(Exception):
+class CircuitOpenError(PaymentUnavailableError):
     """O circuito está aberto: o pagamento nem foi tentado (fail-fast)."""
 
 
-class PaymentFailedError(Exception):
-    """O Payment recusou ou falhou em todas as tentativas."""
+# PaymentFailedError (o Payment recusou ou falhou em todas as tentativas) vem de saga.py: são os dois
+# erros do passo de pagamento que a saga sabe tratar.
 
 
 class PaymentAttemptError(Exception):
@@ -536,14 +559,27 @@ async def charge_payment(app: FastAPI, order: Order) -> dict:
 # Aplicação
 # ---------------------------------------------------------------------------
 
+async def keep_retrying_compensations(app: FastAPI) -> None:
+    """Em segundo plano: volta a tentar as libertações de bilhetes que falharam (Inventory em baixo)."""
+    while True:
+        await asyncio.sleep(SAGA_RECOVERY_SECONDS)
+        try:
+            done = await app.state.saga.retry_failed_compensations()
+            if done:
+                logger.info("Compensações pendentes concluídas: %d", done)
+        except Exception:
+            logger.exception("Erro ao voltar a tentar as compensações pendentes")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Base de dados: uma ligação por processo
-    app.state.db = open_database(ORDERS_DB_PATH)
-    logger.info("Base de dados em %s", ORDERS_DB_PATH)
+    app.state.db = open_database(ORDERS_DB_PATH, SQLITE_JOURNAL_MODE)
+    logger.info("Base de dados em %s (journal_mode=%s)", ORDERS_DB_PATH, SQLITE_JOURNAL_MODE)
 
-    # Clientes HTTP para o Catalog e para o Payment, com ligações reutilizadas (como no Gateway)
+    # Clientes HTTP para o Catalog, o Inventory e o Payment, com ligações reutilizadas (como no Gateway)
     app.state.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CATALOG_TIMEOUT_SECONDS))
+    app.state.inventory_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=INVENTORY_TIMEOUT_SECONDS))
     app.state.payment_http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=PAYMENT_TIMEOUT_SECONDS))
 
     # Circuit breaker das chamadas ao Payment (um por processo)
@@ -556,6 +592,26 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("PAYMENT_URL vazio: as compras são confirmadas sem passar pelo Payment")
 
+    # Saga: o orquestrador da compra
+    inventory = InventoryClient(app.state.inventory_http, INVENTORY_URL) if INVENTORY_URL else None
+    app.state.saga = PurchaseSaga(
+        app.state.db,
+        inventory,
+        (lambda order: charge_payment(app, order)) if PAYMENT_URL else None,
+        compensation_attempts=COMPENSATION_RETRY_ATTEMPTS,
+        compensation_base_seconds=COMPENSATION_RETRY_BASE_SECONDS,
+    )
+    if INVENTORY_URL:
+        logger.info("Reservas no Inventory em %s (timeout %gs)", INVENTORY_URL, INVENTORY_TIMEOUT_SECONDS)
+    else:
+        logger.warning("INVENTORY_URL vazio: as compras não reservam bilhetes no Inventory")
+    # Sagas que ficaram a meio da última vez que o Order parou (antes de aceitar pedidos novos)
+    recovered = app.state.saga.recover_interrupted()
+    if recovered:
+        logger.warning("Sagas interrompidas fechadas no arranque: %d", recovered)
+    recovery_task = (asyncio.create_task(keep_retrying_compensations(app))
+                     if INVENTORY_URL and SAGA_RECOVERY_SECONDS > 0 else None)
+
     # RabbitMQ: liga em segundo plano, para o serviço não ficar bloqueado se o RabbitMQ demorar
     app.state.amqp_channel = None
     app.state.amqp_connection = None
@@ -564,21 +620,25 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    connect_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await connect_task
+    for task in (connect_task, recovery_task):
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
     if app.state.amqp_connection is not None:
         await app.state.amqp_connection.close()
     await app.state.payment_http.close()
+    await app.state.inventory_http.close()
     await app.state.http.close()
     app.state.db.close()
 
 
 app = FastAPI(
     title="TicketMEI - Order",
-    description="Compras de bilhetes. Cada compra é cobrada no Payment (com circuit breaker) e, se for paga, "
-                "fica CONFIRMED e gera uma mensagem OrderCreated no RabbitMQ.",
-    version="2.0.0",
+    description="Compras de bilhetes. Cada compra é uma Saga orquestrada pelo Order: reserva no Inventory, "
+                "cobra no Payment (com circuit breaker) e confirma; se o pagamento falhar, liberta os bilhetes. "
+                "Uma compra confirmada gera a mensagem OrderCreated no RabbitMQ.",
+    version="3.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(MetricsMiddleware)
@@ -588,10 +648,19 @@ def error(status_code: int, detail: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail, **extra})
 
 
-def fail_order(order: Order) -> None:
-    update_status(app.state.db, order.id, "FAILED")
-    order.status = "FAILED"
-    ORDERS_INITIATED.labels(status="FAILED").inc()
+def saga_failure_response(order: Order, result: saga.SagaResult) -> JSONResponse:
+    """Resposta HTTP de uma saga que não terminou em CONFIRMED."""
+    outcome = result.outcome
+    if outcome is SagaOutcome.NOT_ENOUGH_TICKETS:
+        return JSONResponse(status_code=409, content={**NOT_ENOUGH_TICKETS, "order_id": order.id})
+    if outcome is SagaOutcome.UNKNOWN_EVENT:
+        return error(422, f"O evento '{order.event_id}' não tem bilhetes à venda", order_id=order.id)
+    if outcome is SagaOutcome.INVENTORY_UNAVAILABLE:
+        return JSONResponse(status_code=503, content={**INVENTORY_UNAVAILABLE, "order_id": order.id})
+    if outcome is SagaOutcome.PAYMENT_UNAVAILABLE:
+        return JSONResponse(status_code=503, content=PAYMENT_UNAVAILABLE)
+    return JSONResponse(status_code=502, content={"error": "Payment failed", "order_id": order.id,
+                                                  "reason": result.reason})
 
 
 @app.post(
@@ -599,15 +668,18 @@ def fail_order(order: Order) -> None:
     status_code=201,
     response_model=Order,
     responses={
-        422: {"description": "Pedido inválido (campos, email, mais de 4 bilhetes) ou evento inexistente"},
-        502: {"description": "Catalog indisponível, ou pagamento falhou em todas as tentativas (compra FAILED)"},
-        503: {"description": "Circuito do Payment aberto (compra FAILED): "
-                             "{\"error\": \"Payment system unavailable, try again later\"}"},
+        409: {"description": "Sem bilhetes suficientes (compra FAILED): {\"error\": \"Not enough tickets\"}"},
+        422: {"description": "Pedido inválido (campos, email, mais de 4 bilhetes), evento inexistente ou sem stock"},
+        502: {"description": "Catalog indisponível, ou pagamento falhou em todas as tentativas "
+                             "(compra CANCELLED, bilhetes libertados)"},
+        503: {"description": "Circuito do Payment aberto (compra CANCELLED): "
+                             "{\"error\": \"Payment system unavailable, try again later\"}; "
+                             "ou Inventory indisponível (compra FAILED)"},
         504: {"description": "Catalog não respondeu a tempo"},
     },
 )
 async def create_order(request: OrderRequest) -> Response:
-    """Cria uma compra, cobra-a no Payment e, se for paga, confirma-a e publica OrderCreated."""
+    """Cria uma compra e corre a Saga: reservar, cobrar e confirmar (ou libertar os bilhetes)."""
     try:
         price = await fetch_event_price(app, request.event_id)
     except CatalogError as exc:
@@ -623,23 +695,14 @@ async def create_order(request: OrderRequest) -> Response:
         status="PENDING",
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
-    # A compra fica gravada antes de cobrar: se o pagamento falhar, fica registada como FAILED
+    # A compra fica gravada antes da saga: se algum passo falhar, fica registada como FAILED ou CANCELLED
     insert_order(app.state.db, order)
 
-    if PAYMENT_URL:
-        try:
-            await charge_payment(app, order)
-        except CircuitOpenError:
-            fail_order(order)
-            return JSONResponse(status_code=503, content=PAYMENT_UNAVAILABLE)
-        except PaymentFailedError as exc:
-            fail_order(order)
-            return JSONResponse(status_code=502, content={"error": "Payment failed", "order_id": order.id,
-                                                          "reason": str(exc)})
-
-    update_status(app.state.db, order.id, "CONFIRMED")
-    order.status = "CONFIRMED"
-    ORDERS_INITIATED.labels(status="CONFIRMED").inc()
+    result = await app.state.saga.run(order)
+    order.status = result.order_status
+    ORDERS_INITIATED.labels(status=result.order_status).inc()
+    if result.outcome is not SagaOutcome.CONFIRMED:
+        return saga_failure_response(order, result)
 
     # A compra já está paga e confirmada: se a mensagem não puder ser publicada, a compra não muda,
     # só o email de confirmação é que não é enviado (fica no log e na métrica)
@@ -650,6 +713,18 @@ async def create_order(request: OrderRequest) -> Response:
         logger.warning("Compra %s confirmada, mas o OrderCreated não foi publicado: %s", order.id, type(exc).__name__)
 
     return JSONResponse(status_code=201, content=order.model_dump(), headers={"Location": f"/orders/{order.id}"})
+
+
+@app.get("/orders/stats")
+async def order_stats() -> dict:
+    """
+    Contagens das compras e das sagas por estado. Serve para validar o teste k6 das sagas (por exemplo:
+    com 20 bilhetes e 1000 compradores, 20 CONFIRMED e 980 FAILED). Tem de vir antes de /orders/{id}.
+    """
+    orders = dict.fromkeys(("PENDING", "CONFIRMED", "CANCELLED", "FAILED"), 0)
+    for row in app.state.db.execute("SELECT status, COUNT(*) AS n FROM orders GROUP BY status"):
+        orders[row["status"]] = row["n"]
+    return {"orders": orders, "sagas": saga.count_sagas(app.state.db)}
 
 
 @app.get("/orders/{order_id}", response_model=Order, responses={404: {"description": "Compra não encontrada"}})
@@ -664,13 +739,15 @@ async def get_order(order_id: str) -> Response:
 @app.get("/health")
 async def health() -> dict:
     """
-    Indica se o serviço está a funcionar. Não falha se o RabbitMQ ou o Payment estiverem em baixo (o
-    Order continua a responder); mostra o estado da ligação ao RabbitMQ e do circuito do Payment.
+    Indica se o serviço está a funcionar. Não falha se o RabbitMQ, o Inventory ou o Payment estiverem em
+    baixo (o Order continua a responder); mostra o estado da ligação ao RabbitMQ, do circuito do Payment
+    e se o passo do Inventory está ligado.
     """
     return {
         "status": "ok",
         "rabbitmq": "connected" if rabbitmq_is_connected(app) else "disconnected",
         "payment": app.state.breaker.state.name if PAYMENT_URL else "disabled",
+        "inventory": "enabled" if INVENTORY_URL else "disabled",
     }
 
 

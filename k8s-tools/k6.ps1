@@ -4,10 +4,11 @@
 #   .\k8s-tools\k6.ps1 eventos    -> k6/load-test.js   (GET /events, até 500 utilizadores virtuais, ~5,5 min)
 #   .\k8s-tools\k6.ps1 compras    -> k6/orders-test.js (POST e GET /orders, 50 utilizadores virtuais, ~3,5 min)
 #   .\k8s-tools\k6.ps1 limite     -> k6/rate-limit-test.js (um cliente a tentar 20 compras/s durante 30 s: 429)
+#   .\k8s-tools\k6.ps1 cb         -> k6/circuit-breaker-test.js (POST /orders 50/s durante 6 min, falhas aos 2m..4m)
 
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("eventos", "compras", "limite")]
+    [ValidateSet("eventos", "compras", "limite", "cb")]
     [string]$Teste
 )
 

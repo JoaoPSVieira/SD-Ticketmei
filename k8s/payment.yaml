@@ -51,7 +51,7 @@ spec:
         - name: payment
           # A pipeline de CD (.github/workflows/cd.yml) muda esta tag para o SHA do commit.
           # Até lá usa-se a imagem local (k8s-tools/build-local-images.ps1).
-          image: ghcr.io/joaopsvieira/ticketmei-payment:local
+          image: ghcr.io/joaopsvieira/ticketmei-payment:b2cc3d3dabb3770b49934172ed7a44bb49d97393
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

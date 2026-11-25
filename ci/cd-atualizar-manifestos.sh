@@ -12,21 +12,23 @@ BRANCH="${BRANCH:-main}"
 summary=""
 while read -r service tag; do
   sed -i "s|image: $REGISTRY-$service:.*|image: $REGISTRY-$service:$tag|" "k8s/$service.yaml"
+  if [ -f "k3s/$service.yaml" ]; then
+    sed -i "s|image: $REGISTRY-$service:.*|image: $REGISTRY-$service:$tag|" "k3s/$service.yaml"
+  fi
   summary="$summary $service@${tag:0:7}"
 done < <(jq -r '.include[] | "\(.service) \(.tag)"' <<< "$PLANO")
 
-if git diff --quiet -- k8s/; then
+if git diff --quiet -- k8s/ k3s/; then
   echo "As tags já estavam atualizadas: nada a fazer."
   exit 0
 fi
-git --no-pager diff -- k8s/
+git --no-pager diff -- k8s/ k3s/
 
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git add k8s/
+git add k8s/ k3s/
 git commit -m "cd: imagens novas no cluster:$summary"
 
-# Se alguém fez push para o main entretanto, o push é recusado: junta as alterações e tenta outra vez
 for attempt in 1 2 3; do
   if git push origin "HEAD:$BRANCH"; then
     echo "Tags atualizadas no $BRANCH:$summary"

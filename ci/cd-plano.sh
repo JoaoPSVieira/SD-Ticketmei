@@ -13,12 +13,16 @@
 # Correr à mão (na raiz do repositório, por exemplo no Git Bash):   bash ci/cd-plano.sh
 set -euo pipefail
 
-SERVICES="catalog api-gateway order notification"
+SERVICES="catalog api-gateway order notification payment inventory"
 REGISTRY="${REGISTRY:-ghcr.io/joaopsvieira/ticketmei}"
 OUTPUT="${GITHUB_OUTPUT:-/dev/stdout}"
 
 include="[]"
 for service in $SERVICES; do
+  if [ ! -d "$service" ] || [ ! -f "k8s/$service.yaml" ]; then
+    echo "$service: ainda não existe no repositório (ignorado)"
+    continue
+  fi
   code_version="$(git log -1 --format=%H -- "$service/")"
   deployed="$(sed -n "s|^ *image: $REGISTRY-$service:\(.*\)$|\1|p" "k8s/$service.yaml")"
 

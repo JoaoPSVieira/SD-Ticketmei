@@ -22,7 +22,7 @@ spec:
       annotations:
         # Resumo (hash) da fonte de dados, do fornecedor de dashboards e dos dashboards, escrito pelo
         # k8s-tools/gerar-configmaps.py. Se algum mudar, o pod é recriado com a versão nova.
-        ticketmei/config-hash: "f7c062b4b60e"
+        ticketmei/config-hash: "b2a6f03f5dfa"
     spec:
       enableServiceLinks: false
       containers:

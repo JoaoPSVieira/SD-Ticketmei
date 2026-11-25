@@ -17,6 +17,8 @@ on:
       - 'api-gateway/**'
       - 'order/**'
       - 'notification/**'
+      - 'payment/**'
+      - 'inventory/**'
       - 'ci/cd-*.sh'
       - '.github/workflows/cd.yml'
   workflow_dispatch:
@@ -89,7 +91,7 @@ jobs:
         run: docker push "$IMAGE"
 
   manifestos:
-    name: Atualizar as tags em k8s/
+    name: Atualizar as tags em k8s/ e k3s/
     needs: [plano, imagens]
     runs-on: ubuntu-latest
 

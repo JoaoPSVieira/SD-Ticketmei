@@ -51,7 +51,7 @@ spec:
       containers:
         - name: order
           # A pipeline de CD (.github/workflows/cd.yml)
-          image: ghcr.io/joaopsvieira/ticketmei-order:58988c4f7382be1f7ed1353fbb3ea7cf76ee5711
+          image: ghcr.io/joaopsvieira/ticketmei-order:99d8bacaf70b17b47af53d60b99f63b74992e94e
           imagePullPolicy: IfNotPresent
           env:
             - name: CATALOG_URL

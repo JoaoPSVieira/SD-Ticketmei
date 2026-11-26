@@ -51,7 +51,7 @@ spec:
       containers:
         - name: order
           # A pipeline de CD (.github/workflows/cd.yml) atualiza esta linha
-          image: ghcr.io/joaopsvieira/ticketmei-order:252b440f2adcca260ef3698be703dd1b75e7df73
+          image: ghcr.io/joaopsvieira/ticketmei-order:99d8bacaf70b17b47af53d60b99f63b74992e94e
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

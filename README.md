@@ -158,9 +158,10 @@ Configuração (variáveis de ambiente):
 
 | Método | Endpoint         | Descrição                                                                             |
 | ------- | ---------------- | --------------------------------------------------------------------------------------- |
-| POST    | `/orders`      | Cria e cobra uma compra; se for paga, fica `CONFIRMED` e é publicada a mensagem `OrderCreated` no RabbitMQ |
+| POST    | `/orders`      | Cria uma compra (Saga: reservar, cobrar, confirmar); se for paga, fica `CONFIRMED` e é publicada a mensagem `OrderCreated` no RabbitMQ |
+| GET     | `/orders/stats` | Contagens das compras e das sagas por estado (para validar os testes k6)              |
 | GET     | `/orders/{id}` | Detalhes de uma compra (404 se não existir)                                            |
-| GET     | `/health`      | Estado do serviço, da ligação ao RabbitMQ e do circuito do Payment (`CLOSED`, `OPEN`, `HALF_OPEN` ou `disabled`) |
+| GET     | `/health`      | Estado do serviço, da ligação ao RabbitMQ, do circuito do Payment (`CLOSED`, `OPEN`, `HALF_OPEN` ou `disabled`) e se o Inventory está ligado (`enabled` ou `disabled`) |
 | GET     | `/metrics`     | Métricas no formato Prometheus                                                         |
 | GET     | `/docs`        | Documentação interativa da API (Swagger UI)                                           |
 
@@ -172,11 +173,14 @@ Pedido `POST /orders`:
 
 | Resposta          | Quando                                                                                                                                                                              |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `201 Created`   | Compra paga e `CONFIRMED`. O corpo tem a compra (`id`, `total_amount`, `status`, `created_at`, ...) e o cabeçalho `Location: /orders/{id}`. |
-| `422`           | Campos em falta ou inválidos, email inválido, `quantity` fora de 1–4 (RF2), ou evento inexistente                                                                              |
-| `502`           | O Catalog falhou (não foi possível obter o preço), ou o pagamento falhou em todas as tentativas: `{"error": "Payment failed", ...}`, compra `FAILED` |
-| `503`           | O circuito do Payment está aberto: `{"error": "Payment system unavailable, try again later"}`, compra `FAILED`, sem chamar o Payment       |
+| `201 Created`   | Compra reservada, paga e `CONFIRMED`. O corpo tem a compra (`id`, `total_amount`, `status`, `created_at`, ...) e o cabeçalho `Location: /orders/{id}`. |
+| `409`           | Sem bilhetes suficientes: `{"error": "Not enough tickets", "order_id": ...}`, compra `FAILED`, sem cobrar                                                                     |
+| `422`           | Campos em falta ou inválidos, email inválido, `quantity` fora de 1–4 (RF2), evento inexistente, ou evento sem stock no Inventory                                               |
+| `502`           | O Catalog falhou (não foi possível obter o preço), ou o pagamento falhou em todas as tentativas: `{"error": "Payment failed", ...}`, bilhetes libertados, compra `CANCELLED` |
+| `503`           | O circuito do Payment está aberto: `{"error": "Payment system unavailable, try again later"}`, bilhetes libertados, compra `CANCELLED`, sem chamar o Payment; ou o Inventory está indisponível: `{"error": "Inventory unavailable, try again later", ...}`, compra `FAILED` |
 | `504`           | O Catalog não respondeu a tempo                                                                                                                                                  |
+
+Enquanto o Inventory não estiver no sistema (`INVENTORY_URL` vazio), não há reserva nem nada a libertar: um pagamento falhado deixa a compra `FAILED` (como na Fase 1).
 
 Se o RabbitMQ estiver em baixo, a compra paga continua `CONFIRMED` (201): só o email é que não é enviado, e a falha fica no log e na métrica `order_publish_failures_total`.
 
@@ -193,6 +197,30 @@ Cada tentativa de pagamento passa pelo *circuit breaker* (`order/circuit_breaker
 | `CB_FAILURE_THRESHOLD`       | `5`       | Falhas seguidas que abrem o circuito                                       |
 | `CB_OPEN_SECONDS`            | `15`      | Tempo com o circuito aberto até à chamada de teste                         |
 | `CB_HALF_OPEN_MAX_CALLS`     | `1`       | Chamadas de teste no estado semiaberto                                     |
+
+#### Saga orquestrada (reservar → cobrar → confirmar)
+
+Cada compra é uma **Saga orquestrada pelo Order** (`order/saga.py`): o Order decide a ordem dos passos e, se um falhar, desfaz os anteriores. O Inventory e o Payment só recebem pedidos normais e não sabem que a saga existe.
+
+| Passo | Pedido | Se falhar |
+| --- | --- | --- |
+| 1. Reservar | `POST /inventory/reserve` | Sem bilhetes (409) ou evento sem stock (404): compra `FAILED`, nada a desfazer. Inventory indisponível: compra `FAILED` e liberta por segurança (a resposta da reserva pode ter-se perdido) |
+| 2. Cobrar | `POST /payments`, pelo circuit breaker | **Compensação:** `POST /inventory/release`, com até `COMPENSATION_RETRY_ATTEMPTS` tentativas e espera aleatória entre elas; compra `CANCELLED` |
+| 3. Confirmar | — (no Order) | — |
+
+- **Registo:** cada saga tem uma linha na tabela `sagas` (no mesmo SQLite das compras), gravada antes e depois de cada passo: o passo em que vai, se já reservou, se já pagou, o resultado e o erro.
+- **Compensação que falha:** se o Inventory não responder a nenhuma tentativa, a compra fica `CANCELLED` (não foi cobrada), a saga fica `COMPENSATION_FAILED` e o Order volta a tentar a libertação em segundo plano, de `SAGA_RECOVERY_SECONDS` em `SAGA_RECOVERY_SECONDS`.
+- **Recuperação no arranque:** se o Order parar a meio de uma saga, no arranque seguinte termina-a para a frente se já tinha pago (`CONFIRMED`), ou desfaz para trás se ainda não (liberta os bilhetes).
+- **Idempotência:** o Inventory e o Payment tratam um pedido repetido com o mesmo `order_id` como o mesmo pedido, por isso repetir uma reserva, um pagamento ou uma libertação nunca desconta, cobra ou repõe duas vezes. Uma libertação de uma compra sem reserva fica registada no Inventory, para uma reserva atrasada dessa compra ser recusada.
+
+| Variável                          | Valor  | Descrição                                                                 |
+| --------------------------------- | ------ | ------------------------------------------------------------------------- |
+| `INVENTORY_URL`                   | vazio (até haver Inventory) | Endereço do Inventory (`http://inventory:8005`). Vazio: sem passo de reserva |
+| `INVENTORY_TIMEOUT_SECONDS`       | `1`    | Tempo máximo de cada pedido ao Inventory                                  |
+| `COMPENSATION_RETRY_ATTEMPTS`     | `3`    | Tentativas da libertação dos bilhetes durante o pedido                    |
+| `COMPENSATION_RETRY_BASE_SECONDS` | `0.1`  | Base do intervalo aleatório entre essas tentativas                        |
+| `SAGA_RECOVERY_SECONDS`           | `10`   | De quanto em quanto tempo o Order volta a tentar as libertações que falharam (0 desliga) |
+| `SQLITE_JOURNAL_MODE`             | `WAL`  | `DELETE` no cluster global, porque o disco é NFS                          |
 
 O preço vem sempre do Catalog (`total_amount = price_eur × quantity`) e nunca do cliente. As compras ficam numa base de dados SQLite própria do Order, guardada num volume do Docker.
 
@@ -314,11 +342,14 @@ A entrega é **at-least-once**: nenhuma notificação se perde, mas, se o Notifi
 | Catalog      | `catalog_requests_total`                                                                       | Counter   | `endpoint`, `http_status`             |
 | Catalog      | `catalog_request_duration_seconds`                                                             | Histogram | —                                        |
 | cAdvisor     | `container_cpu_usage_seconds_total`, `container_memory_usage_bytes`, ...                     | —        | `name` (nome do contentor), ...         |
-| Order        | `orders_initiated_total`                                                                       | Counter   | `status` (`CONFIRMED`, `FAILED`)    |
+| Order        | `orders_initiated_total`                                                                       | Counter   | `status` (`CONFIRMED`, `CANCELLED`, `FAILED`)    |
 | Order        | `circuit_breaker_state` (0 = CLOSED, 1 = OPEN, 2 = HALF_OPEN)                                   | Gauge     | —                                        |
 | Order        | `circuit_breaker_fallbacks_total`                                                              | Counter   | —                                        |
 | Order        | `payment_client_requests_total`                                                                | Counter   | `status` (`2xx`, `500`, `timeout`, `error`, ...) |
 | Order        | `order_publish_failures_total`                                                                 | Counter   | —                                        |
+| Order        | `saga_transactions_initiated_total`, `saga_transactions_success_total`, `saga_transactions_aborted_total` | Counter   | —                                        |
+| Order        | `saga_compensations_executed_total`                                                            | Counter   | `outcome` (`success`, `failed`)          |
+| Order        | `saga_duration_seconds`                                                                        | Histogram | `outcome` (`success`, `compensated`, `aborted`) |
 | Order        | `order_requests_total`                                                                         | Counter   | `method`, `endpoint`, `http_status` |
 | Order        | `order_request_duration_seconds`                                                               | Histogram | `endpoint`                              |
 | Notification | `notifications_processed_total`                                                                | Counter   | `status` (`SENT`, `FAILED`)         |

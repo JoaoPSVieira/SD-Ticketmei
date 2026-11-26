@@ -14,7 +14,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY main.py circuit_breaker.py ./
+COPY main.py circuit_breaker.py saga.py ./
 
 # Utilizador sem privilégios. A pasta /app/data (onde fica a base de dados SQLite) pertence-lhe,
 # para que o volume do Docker montado nessa pasta herde estas permissões e o serviço possa escrever.

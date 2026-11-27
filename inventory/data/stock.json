@@ -1,0 +1,6 @@
+[
+  {"event_id": "evt-101", "total_tickets": 60000},
+  {"event_id": "evt-102", "total_tickets": 50000},
+  {"event_id": "evt-103", "total_tickets": 55000},
+  {"event_id": "evt-104", "total_tickets": 20000}
+]

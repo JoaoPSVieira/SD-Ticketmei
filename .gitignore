@@ -35,5 +35,8 @@ order/data/
 # BD local do Payment
 payment/data/
 
+# BD local do Inventory (o stock.json da mesma pasta vai para o Git)
+inventory/data/*.db*
+
 # Log de entregas local do Notification (quando corrido sem Docker)
 notification/logs/

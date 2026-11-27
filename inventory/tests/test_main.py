@@ -1,11 +1,14 @@
 """Testes do serviço Inventory. Correr com: python -m pytest (dentro da pasta inventory/)."""
 
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
 
 import main
+from conftest import reserve_request
 
 
 def set_stock(client, event_id: str, total_tickets: int) -> dict:
@@ -84,6 +87,93 @@ def test_infinite_total_is_rejected_with_422_and_not_500(client):
                            headers={"Content-Type": "application/json"})
 
     assert response.status_code == 422
+
+
+def available(client, event_id: str = "evt-101") -> int:
+    return client.get(f"/inventory/{event_id}").json()["available_tickets"]
+
+
+# --- POST /inventory/reserve ----------------------------------------------------------
+
+def test_reserve_takes_the_tickets_and_returns_what_is_left(client):
+    set_stock(client, "evt-101", 20)
+    request = reserve_request(quantity=3)
+
+    response = client.post("/inventory/reserve", json=request)
+
+    assert response.status_code == 200
+    assert response.json() == {"order_id": request["order_id"], "event_id": "evt-101", "quantity": 3,
+                               "available_tickets": 17}
+    assert available(client) == 17
+
+
+def test_reserve_without_enough_tickets_returns_409_and_takes_nothing(client):
+    set_stock(client, "evt-101", 2)
+
+    response = client.post("/inventory/reserve", json=reserve_request(quantity=3))
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "Not enough tickets"}
+    assert available(client) == 2
+
+
+def test_the_last_tickets_can_be_reserved(client):
+    set_stock(client, "evt-101", 2)
+
+    assert client.post("/inventory/reserve", json=reserve_request(quantity=2)).status_code == 200
+    assert client.post("/inventory/reserve", json=reserve_request(quantity=1)).status_code == 409
+    assert available(client) == 0
+
+
+def test_reserve_for_an_event_without_stock_returns_404(client):
+    response = client.post("/inventory/reserve", json=reserve_request(event_id="evt-999"))
+
+    assert response.status_code == 404
+
+
+def test_repeating_a_reservation_does_not_take_the_tickets_twice(client):
+    # O Order pode repetir a reserva (retry): a mesma compra só desconta uma vez
+    set_stock(client, "evt-101", 20)
+    request = reserve_request(quantity=3)
+    first = client.post("/inventory/reserve", json=request)
+
+    second = client.post("/inventory/reserve", json=request)
+
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert available(client) == 17
+
+
+def test_200_simultaneous_reservations_with_20_tickets_sell_exactly_20(client):
+    set_stock(client, "evt-101", 20)
+
+    with ThreadPoolExecutor(max_workers=50) as pool:
+        codes = list(pool.map(lambda _: client.post("/inventory/reserve", json=reserve_request(quantity=1))
+                              .status_code, range(200)))
+
+    assert codes.count(200) == 20
+    assert codes.count(409) == 180
+    assert available(client) == 0
+
+
+@pytest.mark.parametrize("change", [
+    {"quantity": 0},
+    {"quantity": -1},
+    {"order_id": ""},
+    {"event_id": ""},
+])
+def test_reserve_rejects_invalid_requests(client, change):
+    assert client.post("/inventory/reserve", json=reserve_request(**change)).status_code == 422
+
+
+def test_the_database_refuses_negative_stock(tmp_path):
+    # Mesmo que o código tivesse um erro, a base de dados não deixava vender bilhetes que não existem
+    conn = main.open_database(tmp_path / "inventory.db")
+    main.set_stock(conn, "evt-1", 1)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE stock SET available_tickets = available_tickets - 2 WHERE event_id = 'evt-1'")
+    conn.close()
 
 
 def test_health(client):

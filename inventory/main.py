@@ -5,13 +5,21 @@ Guarda o stock de bilhetes de cada evento. O Order reserva os bilhetes aqui ante
 da Saga) e liberta-os se o pagamento falhar (compensação). É o único serviço com acesso ao stock.
 
 Endpoints:
+    POST /inventory/reserve      -> reserva bilhetes para uma compra: 200, 409 sem bilhetes, 404 evento sem stock
     GET  /inventory/{event_id}   -> stock de um evento (404 se não tiver stock definido)
     POST /inventory/stock        -> define o total de um evento e repõe o disponível (prepara os testes)
     GET  /health                 -> estado do serviço
     GET  /metrics                -> métricas no formato Prometheus
 
 Modelo de dados (SQLite):
-    stock (event_id, total_tickets, available_tickets)
+    stock        (event_id, total_tickets, available_tickets)
+    reservations (order_id, event_id, quantity, status RESERVED ou RELEASED, created_at)
+
+Reserva atómica (o centro do RF3): numa só transação,
+    UPDATE stock SET available_tickets = available_tickets - :q WHERE event_id = :e AND available_tickets >= :q
+Se não mudar nenhuma linha, não há bilhetes (409). Com um só processo a escrever e a transação, nunca
+há overbooking, nem com 1000 pedidos ao mesmo tempo. A base de dados também recusa stock negativo.
+A reserva é idempotente pelo order_id: repetir a mesma compra não desconta outra vez.
 
 Stock inicial: no arranque, se a tabela estiver vazia, carrega data/stock.json (a lotação de cada
 evento no Catalog). Depois de um reinício vale o que está na base de dados.
@@ -21,6 +29,7 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -56,6 +65,23 @@ class StockRequest(BaseModel):
     total_tickets: int = Field(ge=0, examples=[20])
 
 
+class ReserveRequest(BaseModel):
+    """Corpo de POST /inventory/reserve, enviado pelo Order no passo 1 da Saga."""
+
+    order_id: str = Field(min_length=1, max_length=100)
+    event_id: str = Field(min_length=1, max_length=100, examples=["evt-101"])
+    quantity: int = Field(ge=1, examples=[2])
+
+
+class Reservation(BaseModel):
+    """Resposta de uma reserva feita: os bilhetes da compra e quantos ficaram disponíveis no evento."""
+
+    order_id: str
+    event_id: str
+    quantity: int
+    available_tickets: int
+
+
 class Stock(BaseModel):
     event_id: str
     total_tickets: int
@@ -84,6 +110,16 @@ CREATE TABLE IF NOT EXISTS stock (
 )
 """
 
+RESERVATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS reservations (
+    order_id   TEXT PRIMARY KEY,
+    event_id   TEXT NOT NULL,
+    quantity   INTEGER NOT NULL CHECK (quantity > 0),
+    status     TEXT NOT NULL CHECK (status IN ('RESERVED', 'RELEASED')),
+    created_at TEXT NOT NULL
+)
+"""
+
 
 def open_database(path: Path) -> sqlite3.Connection:
     """Abre (e cria, se ainda não existir) a base de dados."""
@@ -92,6 +128,7 @@ def open_database(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(SCHEMA)
+    conn.execute(RESERVATIONS_SCHEMA)
     return conn
 
 
@@ -120,6 +157,41 @@ def set_stock(conn: sqlite3.Connection, event_id: str, total_tickets: int) -> St
         {"e": event_id, "t": total_tickets},
     )
     return Stock(event_id=event_id, total_tickets=total_tickets, available_tickets=total_tickets)
+
+
+def reserve(conn: sqlite3.Connection, order_id: str, event_id: str, quantity: int) -> tuple[str, Reservation | None]:
+    """
+    Reserva bilhetes para uma compra. Devolve (resultado, reserva):
+        reserved       reservou agora
+        duplicate      a compra já tinha reserva: devolve-a sem descontar outra vez (retry do Order)
+        insufficient   não há bilhetes suficientes (nada reservado)
+        unknown_event  o evento não tem stock definido (nada reservado)
+
+    Tudo numa transação: o desconto no stock e o registo da reserva ficam gravados juntos ou nada.
+    Sem isso, um processo que morresse entre os dois deixava bilhetes descontados sem dono.
+    """
+    with transaction(conn):
+        previous = conn.execute("SELECT * FROM reservations WHERE order_id = ?", (order_id,)).fetchone()
+        if previous is not None:
+            left = find_stock(conn, previous["event_id"]).available_tickets
+            return "duplicate", Reservation(order_id=order_id, event_id=previous["event_id"],
+                                            quantity=previous["quantity"], available_tickets=left)
+
+        taken = conn.execute(
+            "UPDATE stock SET available_tickets = available_tickets - :q"
+            " WHERE event_id = :e AND available_tickets >= :q",
+            {"q": quantity, "e": event_id},
+        ).rowcount
+        if not taken:
+            return ("insufficient" if find_stock(conn, event_id) else "unknown_event"), None
+
+        conn.execute(
+            "INSERT INTO reservations (order_id, event_id, quantity, status, created_at)"
+            " VALUES (?, ?, ?, 'RESERVED', ?)",
+            (order_id, event_id, quantity, datetime.now(timezone.utc).isoformat(timespec="milliseconds")),
+        )
+        left = find_stock(conn, event_id).available_tickets
+    return "reserved", Reservation(order_id=order_id, event_id=event_id, quantity=quantity, available_tickets=left)
 
 
 def load_initial_stock(conn: sqlite3.Connection, path: Path) -> int:
@@ -164,6 +236,24 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     """
     errors = [{key: value for key, value in err.items() if key != "input"} for err in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
+@app.post(
+    "/inventory/reserve",
+    response_model=Reservation,
+    responses={
+        404: {"description": "O evento não tem stock definido"},
+        409: {"description": '{"error": "Not enough tickets"}'},
+    },
+)
+async def reserve_tickets(request: ReserveRequest) -> Response:
+    """Reserva bilhetes para uma compra (passo 1 da Saga). Idempotente pelo order_id."""
+    result, reservation = reserve(app.state.db, request.order_id, request.event_id, request.quantity)
+    if result == "insufficient":
+        return JSONResponse(status_code=409, content={"error": "Not enough tickets"})
+    if result == "unknown_event":
+        return JSONResponse(status_code=404, content={"detail": f"Evento '{request.event_id}' sem stock definido"})
+    return JSONResponse(content=reservation.model_dump())
 
 
 @app.get("/inventory/{event_id}", response_model=Stock, responses={404: {"description": "Evento sem stock definido"}})

@@ -114,10 +114,9 @@ services:
       # Vazio = sem pagamento (compras confirmadas sem cobrar). Para ver o circuito abrir com um Payment
       # inexistente: PAYMENT_URL=http://naoexiste:8004 docker compose up -d order
       - PAYMENT_URL=${PAYMENT_URL-http://payment:8004}
-      # Saga (Parte II, Fase 2): cada compra reserva os bilhetes no Inventory antes de cobrar. Vazio
-      # enquanto o Inventory não estiver no compose. Quando entrar: INVENTORY_URL=http://inventory:8005
-      # (ou só ${INVENTORY_URL-http://inventory:8005}) e o depends_on do inventory.
-      - INVENTORY_URL=${INVENTORY_URL-}
+      # Saga (Parte II, Fase 2): cada compra reserva os bilhetes no Inventory antes de cobrar.
+      # Vazio = sem passo de reserva (INVENTORY_URL= docker compose up -d order)
+      - INVENTORY_URL=${INVENTORY_URL-http://inventory:8005}
       - PAYMENT_TIMEOUT_SECONDS=1
       - PAYMENT_RETRY_ATTEMPTS=3
       - PAYMENT_RETRY_BASE_SECONDS=0.1
@@ -134,6 +133,8 @@ services:
       rabbitmq:
         condition: service_healthy
       payment:
+        condition: service_healthy
+      inventory:
         condition: service_healthy
     networks:
       - ticketmei-net
@@ -174,7 +175,20 @@ services:
     networks:
       - ticketmei-net
 
+  inventory:
+    build: ./inventory
+    container_name: inventory
+    ports:
+      - "8005:8005"
+    volumes:
+      # Base de dados SQLite do stock e das reservas: sobrevive a reinícios do contentor.
+      # Para voltar ao stock inicial (data/stock.json): docker compose down -v
+      - inventory-data:/app/data
+    networks:
+      - ticketmei-net
+
 volumes:
   order-data:
   notification-logs:
   payment-data:
+  inventory-data:

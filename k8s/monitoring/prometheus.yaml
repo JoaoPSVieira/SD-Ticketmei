@@ -24,7 +24,7 @@ spec:
         # Resumo (hash) da configuração, escrito pelo k8s-tools/gerar-configmaps.py. Quando o
         # prometheus.yml muda, o hash muda, o pod é recriado e o Prometheus arranca com a
         # configuração nova (sem isto, só a leria no próximo reinício).
-        ticketmei/config-hash: "4dd6f523d198"
+        ticketmei/config-hash: "2a3dfca8af78"
     spec:
       enableServiceLinks: false
       containers:

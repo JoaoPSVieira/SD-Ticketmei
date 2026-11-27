@@ -31,11 +31,24 @@ sem descontar. Sem esta regra, os bilhetes ficavam presos numa compra que o Orde
 
 Stock inicial: no arranque, se a tabela estiver vazia, carrega data/stock.json (a lotação de cada
 evento no Catalog). Depois de um reinício vale o que está na base de dados.
+
+Métricas:
+    inventory_reservations_total          Counter    labels: result (reserved, insufficient, unknown_event,
+                                                               duplicate, already_released)
+    inventory_releases_total              Counter    labels: result (released, noop)
+    inventory_available_tickets           Gauge      labels: event_id
+    inventory_requests_total              Counter    labels: endpoint, http_status
+    inventory_request_duration_seconds    Histogram  labels: endpoint
+
+Um só processo (WEB_CONCURRENCY=1): as escritas no SQLite ficam em fila num só processo, o que é
+simples e seguro. O serviço recusa arrancar com mais. As 3 réplicas só chegam com o Raft (B4).
 """
 
 import logging
 import os
 import sqlite3
+import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +57,7 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field, TypeAdapter
 
 # ---------------------------------------------------------------------------
@@ -60,6 +74,20 @@ logger = logging.getLogger("inventory")
 INVENTORY_DB_PATH = Path(os.getenv("INVENTORY_DB_PATH", Path(__file__).parent / "data" / "inventory.db"))
 # Stock inicial, carregado só quando a base de dados ainda não tem stock
 STOCK_FILE = Path(os.getenv("STOCK_FILE", Path(__file__).parent / "data" / "stock.json"))
+
+# Modo do diário do SQLite: WAL no cluster local; DELETE no global, porque o WAL não funciona bem
+# em discos de rede (o nfs-csi do cluster da UMa)
+SQLITE_JOURNAL_MODE = os.getenv("SQLITE_JOURNAL_MODE", "WAL")
+JOURNAL_MODES = {"WAL", "DELETE", "TRUNCATE", "PERSIST"}
+
+
+def check_single_process(env: Mapping[str, str]) -> None:
+    """Recusa arrancar com vários processos (ver "Um só processo" no início do ficheiro)."""
+    if env.get("WEB_CONCURRENCY", "1").strip() != "1":
+        raise RuntimeError(
+            "O Inventory tem de correr com um só processo (WEB_CONCURRENCY=1): as escritas no SQLite ficam "
+            "em fila num só processo. As réplicas só chegam com o Raft."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +164,23 @@ CREATE TABLE IF NOT EXISTS reservations (
 """
 
 
-def open_database(path: Path) -> sqlite3.Connection:
-    """Abre (e cria, se ainda não existir) a base de dados."""
+def open_database(path: Path, journal_mode: str = "WAL") -> sqlite3.Connection:
+    """
+    Abre (e cria, se ainda não existir) a base de dados.
+
+    - journal_mode: WAL (local) ou DELETE (cluster global, disco NFS). É validado contra uma lista
+      fechada antes de entrar no PRAGMA, que não aceita parâmetros.
+    - busy_timeout: se o ficheiro estiver ocupado, espera até 5 s em vez de dar erro.
+    """
+    mode = journal_mode.strip().upper()
+    if mode not in JOURNAL_MODES:
+        raise ValueError(f"SQLITE_JOURNAL_MODE inválido: {journal_mode!r} (usar um de {sorted(JOURNAL_MODES)})")
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5, isolation_level=None)  # sem transações implícitas: usa-se transaction()
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA journal_mode={mode}")
+    if mode == "WAL":
+        conn.execute("PRAGMA synchronous=NORMAL")  # seguro em WAL e muito mais rápido
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(SCHEMA)
     conn.execute(RESERVATIONS_SCHEMA)
@@ -184,8 +224,8 @@ def reserve(conn: sqlite3.Connection, order_id: str, event_id: str, quantity: in
         reserved          reservou agora
         duplicate         a compra já tinha reserva: devolve-a sem descontar outra vez (retry do Order)
         already_released  a compra já foi libertada (a libertação chegou antes desta reserva): nada reservado
-        insufficient   não há bilhetes suficientes (nada reservado)
-        unknown_event  o evento não tem stock definido (nada reservado)
+        insufficient      não há bilhetes suficientes (nada reservado)
+        unknown_event     o evento não tem stock definido (nada reservado)
 
     Tudo numa transação: o desconto no stock e o registo da reserva ficam gravados juntos ou nada.
     Sem isso, um processo que morresse entre os dois deixava bilhetes descontados sem dono.
@@ -216,9 +256,10 @@ def reserve(conn: sqlite3.Connection, order_id: str, event_id: str, quantity: in
     return "reserved", Reservation(order_id=order_id, event_id=event_id, quantity=quantity, available_tickets=left)
 
 
-def release(conn: sqlite3.Connection, order_id: str) -> bool:
+def release(conn: sqlite3.Connection, order_id: str) -> str | None:
     """
-    Liberta os bilhetes de uma compra. Devolve True se havia uma reserva para libertar.
+    Liberta os bilhetes de uma compra. Devolve o evento onde repôs os bilhetes, ou None se não havia
+    nada para repor (a compra já tinha sido libertada, ou nunca reservou).
 
     Se a compra ainda não tem reserva, fica registada como RELEASED (sem evento nem bilhetes), para a
     reserva dessa compra ser recusada se chegar depois.
@@ -231,15 +272,15 @@ def release(conn: sqlite3.Connection, order_id: str) -> bool:
                 " VALUES (?, NULL, 0, 'RELEASED', ?)",
                 (order_id, datetime.now(timezone.utc).isoformat(timespec="milliseconds")),
             )
-            return False
+            return None
         if reservation["status"] == "RELEASED":
-            return False
+            return None
         conn.execute("UPDATE reservations SET status = 'RELEASED' WHERE order_id = ?", (order_id,))
         conn.execute(
             "UPDATE stock SET available_tickets = available_tickets + ? WHERE event_id = ?",
             (reservation["quantity"], reservation["event_id"]),
         )
-    return True
+    return reservation["event_id"]
 
 
 def load_initial_stock(conn: sqlite3.Connection, path: Path) -> int:
@@ -254,16 +295,88 @@ def load_initial_stock(conn: sqlite3.Connection, path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Métricas Prometheus
+# ---------------------------------------------------------------------------
+
+RESERVATIONS = Counter(
+    "inventory_reservations_total",
+    "Pedidos de reserva por resultado (duplicate: a mesma compra repetida; already_released: a reserva "
+    "chegou depois da libertação da compra)",
+    ["result"],
+)
+RELEASES = Counter(
+    "inventory_releases_total",
+    "Pedidos de libertação por resultado (released: repôs bilhetes; noop: não havia nada para repor)",
+    ["result"],
+)
+# Cria as séries a zero logo no arranque, para os gráficos mostrarem 0 em vez de "No data"
+for _result in ("reserved", "insufficient", "unknown_event", "duplicate", "already_released"):
+    RESERVATIONS.labels(result=_result)
+for _result in ("released", "noop"):
+    RELEASES.labels(result=_result)
+
+AVAILABLE = Gauge("inventory_available_tickets", "Bilhetes disponíveis por evento", ["event_id"])
+
+REQUESTS_TOTAL = Counter(
+    "inventory_requests_total",
+    "Total de pedidos HTTP processados pelo Inventory",
+    ["endpoint", "http_status"],
+)
+REQUEST_DURATION = Histogram(
+    "inventory_request_duration_seconds",
+    "Duração dos pedidos HTTP no Inventory, em segundos",
+    ["endpoint"],
+    # O Order desiste ao fim de 1 s (INVENTORY_TIMEOUT_SECONDS): os intervalos concentram-se abaixo disso
+    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+
+UNINSTRUMENTED_PATHS = {"/metrics", "/health"}
+
+
+class MetricsMiddleware:
+    """Mede todos os pedidos HTTP (o mesmo desenho dos outros serviços)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] in UNINSTRUMENTED_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        status_code = 500  # se a aplicação rebentar antes de responder
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        start = time.perf_counter()
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            # Template da rota ("/inventory/{event_id}"), para cada evento não criar uma série nova
+            endpoint = getattr(scope.get("route"), "path", None) or "unmatched"
+            REQUESTS_TOTAL.labels(endpoint=endpoint, http_status=str(status_code)).inc()
+            REQUEST_DURATION.labels(endpoint=endpoint).observe(time.perf_counter() - start)
+
+
+# ---------------------------------------------------------------------------
 # Aplicação
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = open_database(INVENTORY_DB_PATH)
-    logger.info("Base de dados em %s", INVENTORY_DB_PATH)
+    check_single_process(os.environ)
+
+    app.state.db = open_database(INVENTORY_DB_PATH, SQLITE_JOURNAL_MODE)
+    logger.info("Base de dados em %s (journal_mode=%s)", INVENTORY_DB_PATH, SQLITE_JOURNAL_MODE)
     loaded = load_initial_stock(app.state.db, STOCK_FILE)
     if loaded:
         logger.info("Stock inicial: %d eventos carregados de %s", loaded, STOCK_FILE)
+    for row in app.state.db.execute("SELECT event_id, available_tickets FROM stock"):
+        AVAILABLE.labels(event_id=row["event_id"]).set(row["available_tickets"])
     yield
     app.state.db.close()
 
@@ -274,6 +387,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.add_middleware(MetricsMiddleware)
 
 
 @app.exception_handler(RequestValidationError)
@@ -297,19 +411,25 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
 async def reserve_tickets(request: ReserveRequest) -> Response:
     """Reserva bilhetes para uma compra (passo 1 da Saga). Idempotente pelo order_id."""
     result, reservation = reserve(app.state.db, request.order_id, request.event_id, request.quantity)
+    RESERVATIONS.labels(result=result).inc()
     if result == "insufficient":
         return JSONResponse(status_code=409, content={"error": "Not enough tickets"})
     if result == "already_released":
         return JSONResponse(status_code=409, content={"error": "Order already released"})
     if result == "unknown_event":
         return JSONResponse(status_code=404, content={"detail": f"Evento '{request.event_id}' sem stock definido"})
+    AVAILABLE.labels(event_id=reservation.event_id).set(reservation.available_tickets)
     return JSONResponse(content=reservation.model_dump())
 
 
 @app.post("/inventory/release")
 async def release_tickets(request: ReleaseRequest) -> dict:
     """Liberta os bilhetes de uma compra (compensação da Saga). Idempotente: responde sempre 200."""
-    return {"released": release(app.state.db, request.order_id)}
+    event_id = release(app.state.db, request.order_id)
+    RELEASES.labels(result="released" if event_id else "noop").inc()
+    if event_id:
+        AVAILABLE.labels(event_id=event_id).set(find_stock(app.state.db, event_id).available_tickets)
+    return {"released": event_id is not None}
 
 
 @app.get("/inventory/{event_id}", response_model=Stock, responses={404: {"description": "Evento sem stock definido"}})
@@ -326,6 +446,7 @@ async def define_stock(request: StockRequest) -> Stock:
     """Define o total de bilhetes de um evento, repõe o disponível e apaga as reservas desse evento."""
     with transaction(app.state.db):
         stock = set_stock(app.state.db, request.event_id, request.total_tickets)
+    AVAILABLE.labels(event_id=stock.event_id).set(stock.available_tickets)
     logger.info("Stock de %s definido: %d bilhetes", request.event_id, request.total_tickets)
     return stock
 
@@ -334,3 +455,9 @@ async def define_stock(request: StockRequest) -> Stock:
 async def health() -> dict:
     """Indica se o serviço está pronto a responder."""
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    """Expõe as métricas para o Prometheus."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

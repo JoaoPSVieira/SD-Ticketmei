@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
+from prometheus_client import REGISTRY
 
 import main
 from conftest import reserve_request
@@ -268,3 +269,106 @@ def test_health(client):
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+# --- Métricas -------------------------------------------------------------------------
+
+def metric(name: str, **labels) -> float:
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+def test_metrics_endpoint_exposes_the_inventory_metrics(client):
+    text = client.get("/metrics").text
+
+    assert 'inventory_reservations_total{result="reserved"}' in text
+    assert 'inventory_reservations_total{result="insufficient"}' in text
+    assert 'inventory_reservations_total{result="unknown_event"}' in text
+    assert 'inventory_releases_total{result="released"}' in text
+    assert 'inventory_available_tickets{event_id="evt-101"}' in text
+    assert "inventory_request_duration_seconds_bucket" in text
+
+
+def test_reservations_are_counted_by_result(client):
+    set_stock(client, "evt-101", 3)
+    results = ("reserved", "duplicate", "insufficient", "unknown_event", "already_released")
+    before = {r: metric("inventory_reservations_total", result=r) for r in results}
+    paid = reserve_request(quantity=2)
+
+    client.post("/inventory/reserve", json=paid)                                 # reserved
+    client.post("/inventory/reserve", json=paid)                                 # duplicate
+    client.post("/inventory/reserve", json=reserve_request(quantity=2))          # insufficient
+    client.post("/inventory/reserve", json=reserve_request(event_id="evt-999"))  # unknown_event
+    late = reserve_request(quantity=1)
+    release(client, late["order_id"])
+    client.post("/inventory/reserve", json=late)                                 # already_released
+
+    assert {r: metric("inventory_reservations_total", result=r) - before[r] for r in results} == {
+        r: 1 for r in results
+    }
+
+
+def test_releases_are_counted_by_result(client):
+    set_stock(client, "evt-101", 20)
+    before = {r: metric("inventory_releases_total", result=r) for r in ("released", "noop")}
+    request = reserve_request()
+    client.post("/inventory/reserve", json=request)
+
+    release(client, request["order_id"])  # released
+    release(client, request["order_id"])  # noop
+    release(client, "sem-reserva")        # noop
+
+    assert metric("inventory_releases_total", result="released") - before["released"] == 1
+    assert metric("inventory_releases_total", result="noop") - before["noop"] == 2
+
+
+def test_available_tickets_gauge_follows_the_stock(client):
+    expected = json.loads(main.STOCK_FILE.read_text(encoding="utf-8"))[0]
+    assert metric("inventory_available_tickets", event_id=expected["event_id"]) == expected["total_tickets"]
+
+    set_stock(client, "evt-101", 20)
+    assert metric("inventory_available_tickets", event_id="evt-101") == 20
+    request = reserve_request(quantity=3)
+    client.post("/inventory/reserve", json=request)
+    assert metric("inventory_available_tickets", event_id="evt-101") == 17
+    release(client, request["order_id"])
+    assert metric("inventory_available_tickets", event_id="evt-101") == 20
+
+
+def test_requests_are_counted_by_route_and_status(client):
+    before_ok = metric("inventory_requests_total", endpoint="/inventory/{event_id}", http_status="200")
+    before_404 = metric("inventory_requests_total", endpoint="/inventory/{event_id}", http_status="404")
+    before_duration = metric("inventory_request_duration_seconds_count", endpoint="/inventory/{event_id}")
+
+    client.get("/inventory/evt-101")
+    client.get("/inventory/evt-999")
+    client.get("/metrics")
+    client.get("/health")
+
+    assert metric("inventory_requests_total", endpoint="/inventory/{event_id}", http_status="200") == before_ok + 1
+    assert metric("inventory_requests_total", endpoint="/inventory/{event_id}", http_status="404") == before_404 + 1
+    assert metric("inventory_request_duration_seconds_count", endpoint="/inventory/{event_id}") == before_duration + 2
+    assert metric("inventory_requests_total", endpoint="/metrics", http_status="200") == 0
+
+
+# --- SQLite e processos ---------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", ["WAL", "DELETE"])
+def test_journal_mode_is_configurable(tmp_path, mode):
+    # WAL no cluster local; DELETE no global, porque o WAL não funciona bem em discos de rede (NFS)
+    conn = main.open_database(tmp_path / "inventory.db", journal_mode=mode)
+
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == mode.lower()
+    conn.close()
+
+
+def test_invalid_journal_mode_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        main.open_database(tmp_path / "inventory.db", journal_mode="WAL; DROP TABLE stock")
+
+
+def test_the_service_refuses_to_run_with_more_than_one_process():
+    main.check_single_process({"WEB_CONCURRENCY": "1"})
+    main.check_single_process({})
+
+    with pytest.raises(RuntimeError):
+        main.check_single_process({"WEB_CONCURRENCY": "2"})

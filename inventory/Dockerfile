@@ -37,7 +37,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
 
 # Um só processo (WEB_CONCURRENCY=1): as escritas no SQLite ficam em fila num só processo, o que é
 # simples e seguro (e no cluster global o disco é NFS, onde vários escritores dão "database is locked").
-# Para escalar usam-se réplicas, não processos.
+# O serviço recusa arrancar com mais. As 3 réplicas só chegam com o Raft (B4).
 ENV WEB_CONCURRENCY=1
 
 CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port 8005 --workers \"$WEB_CONCURRENCY\" --no-access-log"]

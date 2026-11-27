@@ -166,6 +166,93 @@ def test_reserve_rejects_invalid_requests(client, change):
     assert client.post("/inventory/reserve", json=reserve_request(**change)).status_code == 422
 
 
+# --- POST /inventory/release (compensação da Saga) --------------------------------------
+
+def release(client, order_id: str):
+    return client.post("/inventory/release", json={"order_id": order_id})
+
+
+def test_release_gives_the_tickets_back(client):
+    set_stock(client, "evt-101", 20)
+    request = reserve_request(quantity=3)
+    client.post("/inventory/reserve", json=request)
+
+    response = release(client, request["order_id"])
+
+    assert response.status_code == 200
+    assert response.json() == {"released": True}
+    assert available(client) == 20
+
+
+def test_releasing_twice_gives_the_tickets_back_only_once(client):
+    # O Order repete a compensação se não receber resposta: a segunda não pode repor outra vez
+    set_stock(client, "evt-101", 20)
+    request = reserve_request(quantity=3)
+    client.post("/inventory/reserve", json=request)
+    release(client, request["order_id"])
+
+    response = release(client, request["order_id"])
+
+    assert response.status_code == 200
+    assert response.json() == {"released": False}
+    assert available(client) == 20
+
+
+def test_releasing_an_order_without_reservation_returns_false(client):
+    response = release(client, "compra-sem-reserva")
+
+    assert response.status_code == 200
+    assert response.json() == {"released": False}
+
+
+def test_a_reservation_that_arrives_after_its_release_is_refused(client):
+    # A reserva demorou mais do que o timeout do Order (1 s): o Order desistiu e libertou "por
+    # segurança". Se a reserva atrasada chegasse depois e descontasse, os bilhetes ficavam presos
+    # numa compra FAILED. Por isso a libertação fica registada e a reserva atrasada é recusada.
+    set_stock(client, "evt-101", 20)
+    request = reserve_request(quantity=3)
+    assert release(client, request["order_id"]).json() == {"released": False}
+
+    response = client.post("/inventory/reserve", json=request)
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "Order already released"}
+    assert available(client) == 20
+
+
+def test_a_released_order_cannot_reserve_again(client):
+    set_stock(client, "evt-101", 20)
+    request = reserve_request(quantity=3)
+    client.post("/inventory/reserve", json=request)
+    release(client, request["order_id"])
+
+    response = client.post("/inventory/reserve", json=request)
+
+    assert response.status_code == 409
+    assert response.json() == {"error": "Order already released"}
+    assert available(client) == 20
+
+
+def test_set_stock_deletes_the_reservations_of_that_event_only(client):
+    set_stock(client, "evt-101", 20)
+    set_stock(client, "evt-102", 20)
+    on_101, on_102 = reserve_request(quantity=3), reserve_request(event_id="evt-102", quantity=3)
+    client.post("/inventory/reserve", json=on_101)
+    client.post("/inventory/reserve", json=on_102)
+
+    set_stock(client, "evt-101", 20)
+
+    # A reserva do evt-101 já não existe: libertá-la não pode pôr o disponível acima do total
+    assert release(client, on_101["order_id"]).json() == {"released": False}
+    assert available(client, "evt-101") == 20
+    assert release(client, on_102["order_id"]).json() == {"released": True}
+    assert available(client, "evt-102") == 20
+
+
+def test_release_requires_the_order_id(client):
+    assert client.post("/inventory/release", json={}).status_code == 422
+
+
 def test_the_database_refuses_negative_stock(tmp_path):
     # Mesmo que o código tivesse um erro, a base de dados não deixava vender bilhetes que não existem
     conn = main.open_database(tmp_path / "inventory.db")

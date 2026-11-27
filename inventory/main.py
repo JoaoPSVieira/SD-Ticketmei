@@ -6,8 +6,10 @@ da Saga) e liberta-os se o pagamento falhar (compensação). É o único serviç
 
 Endpoints:
     POST /inventory/reserve      -> reserva bilhetes para uma compra: 200, 409 sem bilhetes, 404 evento sem stock
+    POST /inventory/release      -> liberta os bilhetes de uma compra (compensação): {"released": true/false}
     GET  /inventory/{event_id}   -> stock de um evento (404 se não tiver stock definido)
-    POST /inventory/stock        -> define o total de um evento e repõe o disponível (prepara os testes)
+    POST /inventory/stock        -> define o total de um evento, repõe o disponível e apaga as reservas desse
+                                    evento (prepara os testes)
     GET  /health                 -> estado do serviço
     GET  /metrics                -> métricas no formato Prometheus
 
@@ -20,6 +22,12 @@ Reserva atómica (o centro do RF3): numa só transação,
 Se não mudar nenhuma linha, não há bilhetes (409). Com um só processo a escrever e a transação, nunca
 há overbooking, nem com 1000 pedidos ao mesmo tempo. A base de dados também recusa stock negativo.
 A reserva é idempotente pelo order_id: repetir a mesma compra não desconta outra vez.
+
+Libertação (compensação da Saga), também idempotente: só a primeira repõe os bilhetes.
+Libertação antes da reserva: quando a reserva demora mais do que o timeout do Order (1 s), o Order
+desiste e liberta "por segurança". Se a libertação chegar primeiro, fica registada (RELEASED, sem
+bilhetes), e a reserva atrasada, quando chegar, é recusada com 409 {"error": "Order already released"}
+sem descontar. Sem esta regra, os bilhetes ficavam presos numa compra que o Order já deu como FAILED.
 
 Stock inicial: no arranque, se a tabela estiver vazia, carrega data/stock.json (a lotação de cada
 evento no Catalog). Depois de um reinício vale o que está na base de dados.
@@ -73,6 +81,12 @@ class ReserveRequest(BaseModel):
     quantity: int = Field(ge=1, examples=[2])
 
 
+class ReleaseRequest(BaseModel):
+    """Corpo de POST /inventory/release, enviado pelo Order na compensação da Saga."""
+
+    order_id: str = Field(min_length=1, max_length=100)
+
+
 class Reservation(BaseModel):
     """Resposta de uma reserva feita: os bilhetes da compra e quantos ficaram disponíveis no evento."""
 
@@ -113,8 +127,9 @@ CREATE TABLE IF NOT EXISTS stock (
 RESERVATIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS reservations (
     order_id   TEXT PRIMARY KEY,
-    event_id   TEXT NOT NULL,
-    quantity   INTEGER NOT NULL CHECK (quantity > 0),
+    -- event_id NULL e quantity 0: libertação que chegou antes da reserva (ver release)
+    event_id   TEXT,
+    quantity   INTEGER NOT NULL CHECK (quantity >= 0),
     status     TEXT NOT NULL CHECK (status IN ('RESERVED', 'RELEASED')),
     created_at TEXT NOT NULL
 )
@@ -150,7 +165,11 @@ def find_stock(conn: sqlite3.Connection, event_id: str) -> Stock | None:
 
 
 def set_stock(conn: sqlite3.Connection, event_id: str, total_tickets: int) -> Stock:
-    """Define o total de um evento (cria-o se não existir) e repõe o disponível."""
+    """
+    Define o total de um evento (cria-o se não existir), repõe o disponível e apaga as reservas desse
+    evento, para uma libertação antiga não pôr o disponível acima do total. Chamar dentro de transaction().
+    """
+    conn.execute("DELETE FROM reservations WHERE event_id = ?", (event_id,))
     conn.execute(
         "INSERT INTO stock (event_id, total_tickets, available_tickets) VALUES (:e, :t, :t)"
         " ON CONFLICT (event_id) DO UPDATE SET total_tickets = :t, available_tickets = :t",
@@ -162,8 +181,9 @@ def set_stock(conn: sqlite3.Connection, event_id: str, total_tickets: int) -> St
 def reserve(conn: sqlite3.Connection, order_id: str, event_id: str, quantity: int) -> tuple[str, Reservation | None]:
     """
     Reserva bilhetes para uma compra. Devolve (resultado, reserva):
-        reserved       reservou agora
-        duplicate      a compra já tinha reserva: devolve-a sem descontar outra vez (retry do Order)
+        reserved          reservou agora
+        duplicate         a compra já tinha reserva: devolve-a sem descontar outra vez (retry do Order)
+        already_released  a compra já foi libertada (a libertação chegou antes desta reserva): nada reservado
         insufficient   não há bilhetes suficientes (nada reservado)
         unknown_event  o evento não tem stock definido (nada reservado)
 
@@ -172,6 +192,8 @@ def reserve(conn: sqlite3.Connection, order_id: str, event_id: str, quantity: in
     """
     with transaction(conn):
         previous = conn.execute("SELECT * FROM reservations WHERE order_id = ?", (order_id,)).fetchone()
+        if previous is not None and previous["status"] == "RELEASED":
+            return "already_released", None
         if previous is not None:
             left = find_stock(conn, previous["event_id"]).available_tickets
             return "duplicate", Reservation(order_id=order_id, event_id=previous["event_id"],
@@ -192,6 +214,32 @@ def reserve(conn: sqlite3.Connection, order_id: str, event_id: str, quantity: in
         )
         left = find_stock(conn, event_id).available_tickets
     return "reserved", Reservation(order_id=order_id, event_id=event_id, quantity=quantity, available_tickets=left)
+
+
+def release(conn: sqlite3.Connection, order_id: str) -> bool:
+    """
+    Liberta os bilhetes de uma compra. Devolve True se havia uma reserva para libertar.
+
+    Se a compra ainda não tem reserva, fica registada como RELEASED (sem evento nem bilhetes), para a
+    reserva dessa compra ser recusada se chegar depois.
+    """
+    with transaction(conn):
+        reservation = conn.execute("SELECT * FROM reservations WHERE order_id = ?", (order_id,)).fetchone()
+        if reservation is None:
+            conn.execute(
+                "INSERT INTO reservations (order_id, event_id, quantity, status, created_at)"
+                " VALUES (?, NULL, 0, 'RELEASED', ?)",
+                (order_id, datetime.now(timezone.utc).isoformat(timespec="milliseconds")),
+            )
+            return False
+        if reservation["status"] == "RELEASED":
+            return False
+        conn.execute("UPDATE reservations SET status = 'RELEASED' WHERE order_id = ?", (order_id,))
+        conn.execute(
+            "UPDATE stock SET available_tickets = available_tickets + ? WHERE event_id = ?",
+            (reservation["quantity"], reservation["event_id"]),
+        )
+    return True
 
 
 def load_initial_stock(conn: sqlite3.Connection, path: Path) -> int:
@@ -243,7 +291,7 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
     response_model=Reservation,
     responses={
         404: {"description": "O evento não tem stock definido"},
-        409: {"description": '{"error": "Not enough tickets"}'},
+        409: {"description": '{"error": "Not enough tickets"} ou {"error": "Order already released"}'},
     },
 )
 async def reserve_tickets(request: ReserveRequest) -> Response:
@@ -251,9 +299,17 @@ async def reserve_tickets(request: ReserveRequest) -> Response:
     result, reservation = reserve(app.state.db, request.order_id, request.event_id, request.quantity)
     if result == "insufficient":
         return JSONResponse(status_code=409, content={"error": "Not enough tickets"})
+    if result == "already_released":
+        return JSONResponse(status_code=409, content={"error": "Order already released"})
     if result == "unknown_event":
         return JSONResponse(status_code=404, content={"detail": f"Evento '{request.event_id}' sem stock definido"})
     return JSONResponse(content=reservation.model_dump())
+
+
+@app.post("/inventory/release")
+async def release_tickets(request: ReleaseRequest) -> dict:
+    """Liberta os bilhetes de uma compra (compensação da Saga). Idempotente: responde sempre 200."""
+    return {"released": release(app.state.db, request.order_id)}
 
 
 @app.get("/inventory/{event_id}", response_model=Stock, responses={404: {"description": "Evento sem stock definido"}})
@@ -267,8 +323,9 @@ async def get_stock(event_id: str) -> Response:
 
 @app.post("/inventory/stock", response_model=Stock)
 async def define_stock(request: StockRequest) -> Stock:
-    """Define o total de bilhetes de um evento e repõe o disponível (serve para preparar os testes)."""
-    stock = set_stock(app.state.db, request.event_id, request.total_tickets)
+    """Define o total de bilhetes de um evento, repõe o disponível e apaga as reservas desse evento."""
+    with transaction(app.state.db):
+        stock = set_stock(app.state.db, request.event_id, request.total_tickets)
     logger.info("Stock de %s definido: %d bilhetes", request.event_id, request.total_tickets)
     return stock
 

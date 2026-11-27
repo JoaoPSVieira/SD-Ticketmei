@@ -79,10 +79,10 @@ spec:
             # são confirmadas sem cobrar).
             - name: PAYMENT_URL
               value: http://payment:8004
-            # Saga (Parte II, Fase 2): reserva no Inventory antes de cobrar. Vazio enquanto não existir o
-            # k8s/inventory.yaml; depois: http://inventory:8005
+            # Saga (Parte II, Fase 2): reserva no Inventory (o Service do k8s/inventory.yaml) antes de
+            # cobrar. Vazio = sem passo de reserva.
             - name: INVENTORY_URL
-              value: ""
+              value: http://inventory:8005
             # Cada tentativa espera no máximo 1 s; 3 tentativas com espera aleatória entre elas.
             # Pior caso: ~3,3 s, abaixo dos 5 s que o Gateway espera pelo Order (ORDER_TIMEOUT_SECONDS)
             - name: PAYMENT_TIMEOUT_SECONDS

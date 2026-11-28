@@ -65,6 +65,8 @@ As linhas tracejadas são o Prometheus a recolher métricas (*scrape*) de cada c
 ├── order/                        # Order (Python, FastAPI + SQLite + aio-pika)
 ├── notification/                 # Notification (Python, aio-pika)
 ├── payment/                      # Payment (Python, FastAPI + SQLite), com falhas configuráveis (Parte II)
+├── inventory/                    # Inventory (Python, FastAPI + SQLite): stock e reservas atómicas (Parte II)
+│   └── data/stock.json           # Stock inicial de cada evento
 ├── prometheus/
 │   └── prometheus.yml            # Configuração de scraping
 ├── grafana/
@@ -110,6 +112,7 @@ O API Gateway só arranca depois de o healthcheck do Catalog passar, e o k6 só 
 | Order                    | http://localhost:8002 (documentação: http://localhost:8002/docs) |
 | Notification             | http://localhost:8003/metrics                                      |
 | Payment                  | http://localhost:8004 (documentação: http://localhost:8004/docs) |
+| Inventory                | http://localhost:8005 (documentação: http://localhost:8005/docs) |
 | RabbitMQ (interface web) | http://localhost:15672 (ticketmei / ticketmei)                     |
 | RabbitMQ (métricas)     | http://localhost:15692/metrics                                     |
 | Prometheus               | http://localhost:9090                                              |
@@ -281,6 +284,37 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8004/payments/configure-fau
 
 No cluster local: `kubectl port-forward svc/payment -n ticketmei 8004:8004`.
 
+### Inventory (porta 8005)
+
+Guarda o stock de bilhetes de cada evento (Parte II, Fase 2). O Order reserva aqui os bilhetes antes de cobrar (passo 1 da Saga) e liberta-os se o pagamento falhar (compensação). Não é exposto pelo Gateway.
+
+| Método | Endpoint                 | Descrição                                                                                                   |
+| ------- | ------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| POST    | `/inventory/reserve`   | Reserva bilhetes: `{"order_id", "event_id", "quantity"}` → `{order_id, event_id, quantity, available_tickets}` |
+| POST    | `/inventory/release`   | Liberta os bilhetes de uma compra: `{"order_id"}` → `{"released": true}` ou `{"released": false}`         |
+| GET     | `/inventory/{event_id}` | `{event_id, total_tickets, available_tickets}` (404 se o evento não tiver stock)                            |
+| POST    | `/inventory/stock`     | Define o total de um evento, repõe o disponível e apaga as reservas desse evento (prepara os testes)      |
+| GET     | `/health`, `/metrics`  | Estado do serviço e métricas no formato Prometheus                                                          |
+
+| Resposta de `POST /inventory/reserve` | Quando                                                                                                        |
+| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `200`                                  | Bilhetes reservados. Repetir a mesma compra devolve a mesma reserva sem descontar outra vez (idempotente)     |
+| `409` `{"error": "Not enough tickets"}` | Não há bilhetes suficientes; nada fica reservado                                                             |
+| `409` `{"error": "Order already released"}` | A compra já foi libertada: a libertação chegou antes desta reserva (ver abaixo); nada fica reservado    |
+| `404`                                  | O evento não tem stock definido                                                                                |
+
+- **Reserva atómica, sem overbooking:** numa só transação, `UPDATE stock SET available_tickets = available_tickets - :q WHERE event_id = :e AND available_tickets >= :q`. Se não mudar nenhuma linha, não há bilhetes. O serviço corre com um só processo (as escritas ficam em fila) e a base de dados recusa stock negativo. 200 reservas em simultâneo com 20 bilhetes dão exatamente 20.
+- **Libertação idempotente:** só a primeira repõe os bilhetes; as seguintes respondem `released: false`.
+- **Libertação antes da reserva:** se a reserva demora mais do que o timeout do Order (1 s), o Order desiste e liberta "por segurança". Se essa libertação chegar primeiro, fica registada, e a reserva atrasada é recusada com 409, para os bilhetes não ficarem presos numa compra que o Order já deu como `FAILED`.
+- **Stock inicial:** se a base de dados estiver vazia, carrega `inventory/data/stock.json` (a lotação de cada evento no Catalog). Depois vale o que está na base de dados; para voltar ao início, `docker compose down -v`.
+
+| Variável               | Por omissão | Descrição                                            |
+| ----------------------- | ------------ | ------------------------------------------------------ |
+| `SQLITE_JOURNAL_MODE` | `WAL`      | `WAL` no cluster local; `DELETE` no global (disco NFS) |
+| `WEB_CONCURRENCY`     | `1`        | Tem de ser 1                                           |
+
+No cluster local: `kubectl port-forward svc/inventory -n ticketmei 8005:8005`.
+
 ### Verificação rápida
 
 ```bash
@@ -357,6 +391,10 @@ A entrega é **at-least-once**: nenhuma notificação se perde, mas, se o Notifi
 | Payment      | `payment_requests_total` (só `POST /payments`)                                               | Counter   | `http_status`                           |
 | Payment      | `payment_processing_duration_seconds` (inclui a latência injetada; intervalos até 15 s)     | Histogram | —                                        |
 | Payment      | `payment_fault_error_rate`, `payment_fault_latency_seconds` (falhas configuradas)           | Gauge     | —                                        |
+| Inventory    | `inventory_reservations_total`                                                                 | Counter   | `result` (`reserved`, `insufficient`, `unknown_event`, `duplicate`, `already_released`) |
+| Inventory    | `inventory_releases_total`                                                                     | Counter   | `result` (`released`, `noop`)       |
+| Inventory    | `inventory_available_tickets`                                                                  | Gauge     | `event_id`                              |
+| Inventory    | `inventory_requests_total`, `inventory_request_duration_seconds`                             | Counter, Histogram | `endpoint`, `http_status`      |
 | RabbitMQ     | `rabbitmq_detailed_queue_messages_ready`, `..._unacked` (tamanho da fila) e métricas gerais | —        | `queue`, ...                            |
 
 - O label `endpoint` guarda o template da rota (`/events`, `/events/{event_id}`) e não o caminho real, para que cada id não crie uma série temporal nova (cardinalidade controlada). Caminhos inexistentes ficam agrupados em `unmatched`.

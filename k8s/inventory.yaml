@@ -1,0 +1,114 @@
+# Inventory: stock de bilhetes de cada evento. O Order reserva aqui antes de cobrar (passo 1 da Saga)
+# e liberta os bilhetes se o pagamento falhar (compensação).
+
+# Disco persistente para a base de dados SQLite (equivale ao volume inventory-data do compose)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: inventory-data
+  namespace: ticketmei
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory
+  namespace: ticketmei
+  labels:
+    app: inventory
+spec:
+  # Uma réplica com um só processo: um só escritor no SQLite (as 3 réplicas só chegam com o Raft)
+  replicas: 1
+  # Recreate: o pod antigo para antes de o novo arrancar, para nunca haver dois a escrever no mesmo
+  # ficheiro SQLite (no cluster global o disco é NFS). Nesses segundos o Order responde 503 e liberta
+  # "por segurança" as reservas que ficaram sem resposta.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: inventory
+  template:
+    metadata:
+      labels:
+        app: inventory
+    spec:
+      enableServiceLinks: false
+      # Regras "restricted" do cluster global (Pod Security): sem root, sem privilégios.
+      # runAsUser é obrigatório porque o Dockerfile define o utilizador pelo nome (appuser, uid 10001).
+      # fsGroup: o disco passa a pertencer ao grupo 10001, para o appuser poder criar o inventory.db.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: inventory
+          # A pipeline de CD (.github/workflows/cd.yml) muda esta tag para o SHA do commit.
+          # Até lá usa-se a imagem local (k8s-tools/build-local-images.ps1).
+          image: ghcr.io/joaopsvieira/ticketmei-inventory:local
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: INVENTORY_DB_PATH
+              value: /app/data/inventory.db
+            - name: WEB_CONCURRENCY
+              value: "1"
+            # WAL no cluster local; no global (disco NFS) usa-se DELETE
+            - name: SQLITE_JOURNAL_MODE
+              value: WAL
+          ports:
+            - name: http
+              containerPort: 8005
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: inventory-data
+---
+# Nome "inventory" no DNS do cluster (http://inventory:8005). O Order chama-o aqui; não é exposto pelo Gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory
+  namespace: ticketmei
+  labels:
+    app: inventory
+spec:
+  selector:
+    app: inventory
+  ports:
+    - name: http
+      port: 8005
+      targetPort: http

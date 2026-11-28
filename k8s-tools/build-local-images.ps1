@@ -8,7 +8,7 @@
 # do GHCR com a tag do commit e este script deixa de ser necessário.
 
 $ErrorActionPreference = "Stop"
-$services = @("catalog", "api-gateway", "order", "notification", "payment")
+$services = @("catalog", "api-gateway", "order", "notification", "payment", "inventory")
 
 foreach ($service in $services) {
     $image = "ghcr.io/joaopsvieira/ticketmei-${service}:local"

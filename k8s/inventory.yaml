@@ -51,7 +51,7 @@ spec:
         - name: inventory
           # A pipeline de CD (.github/workflows/cd.yml) muda esta tag para o SHA do commit.
           # Até lá usa-se a imagem local (k8s-tools/build-local-images.ps1).
-          image: ghcr.io/joaopsvieira/ticketmei-inventory:local
+          image: ghcr.io/joaopsvieira/ticketmei-inventory:1456b9d3fcebeba6e36a66b59e762f488b68f7ae
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
